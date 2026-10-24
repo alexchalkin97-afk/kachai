@@ -77,8 +77,6 @@ import app.kachai.ads.Ads
 import app.kachai.billing.Quota
 import app.kachai.dl.FormatOption
 import app.kachai.dl.MediaInfo
-import app.kachai.net.Router
-import app.kachai.net.VpsConfig
 import coil3.compose.AsyncImage
 
 @Composable
@@ -162,7 +160,6 @@ fun HomeScreen(
             when (state) {
                 is Lookup.Ready -> ResultCard(
                     info = state.info,
-                    viaVps = state.viaVps,
                     selected = vm.selected,
                     onSelect = { if (vm.isLocked(it)) onOpenPremium() else vm.selected = it },
                     isLocked = vm::isLocked,
@@ -231,8 +228,6 @@ fun HomeScreen(
             SupportedSites()
         }
 
-        Spacer(Modifier.height(24.dp))
-        RouteStatus(vm)
         Spacer(Modifier.height(16.dp))
     }
 }
@@ -277,7 +272,6 @@ private fun LinkField(
 @Composable
 private fun ResultCard(
     info: MediaInfo,
-    viaVps: Boolean,
     selected: FormatOption?,
     onSelect: (FormatOption) -> Unit,
     isLocked: (FormatOption) -> Boolean,
@@ -331,7 +325,7 @@ private fun ResultCard(
                 Text(info.title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    listOfNotNull(info.uploader, info.site.takeIf { it.isNotBlank() }, if (viaVps) "через сервер" else null)
+                    listOfNotNull(info.uploader, info.site.takeIf { it.isNotBlank() })
                         .joinToString(" · "),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -461,28 +455,18 @@ private fun SupportedSites() {
     Column {
         SectionTitle("Откуда можно качать")
         Text(
-            "YouTube, Instagram, VK Видео, TikTok, Rutube, Дзен, Одноклассники и ещё более 1000 сайтов.",
+            "VK Видео, Rutube, Дзен, Одноклассники, YouTube, TikTok и ещё более 1000 сайтов.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
         )
-    }
-}
-
-@Composable
-private fun RouteStatus(vm: MainViewModel) {
-    val vpn by vm.vpnOn.collectAsStateWithLifecycle()
-    val url = MainViewModel.extractUrl(vm.input)
-    val (color, text) = when {
-        url != null && Router.isDomestic(url) -> MaterialTheme.colorScheme.onSurfaceVariant to "Российский сайт — качаем напрямую"
-        vpn -> Color(0xFF2E9E5B) to "VPN включён — качаем через него"
-        VpsConfig.isAvailable() -> MaterialTheme.colorScheme.primary to "Качаем через сервер Качай"
-        else -> MaterialTheme.colorScheme.onSurfaceVariant to "Напрямую"
-    }
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 4.dp)) {
-        Dot(color)
-        Spacer(Modifier.width(8.dp))
-        Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            RIGHTS_NOTICE,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
     }
 }
 

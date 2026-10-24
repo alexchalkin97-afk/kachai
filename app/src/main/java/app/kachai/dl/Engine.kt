@@ -20,17 +20,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Что нашли по ссылке. */
@@ -46,11 +36,9 @@ data class MediaInfo(
     val options: List<FormatOption>,
     /**
      * Ответ yt-dlp при поиске. Загрузка берёт его через --load-info-json и не разбирает страницу
-     * заново (через сервер это лишние ~15 с «подключения»). Ссылки на файлы у YouTube привязаны
-     * к IP, поэтому годится только для того же маршрута, каким шёл поиск ([lookupViaVps]).
+     * заново — это лишние секунды «подготовки».
      */
     val infoJsonPath: String? = null,
-    val lookupViaVps: Boolean = false,
 )
 
 /** Вариант загрузки, который видит пользователь. */
@@ -101,11 +89,11 @@ class EngineException(
 object Engine {
     private const val TAG = "Engine"
     private const val LOOKUP_TIMEOUT_MS = 75_000L
-    /** Адрес службы поиска внутри туннеля: Xray на сервере ведёт его на 127.0.0.1:8090 (server/setup-api.sh). */
-    private const val REMOTE_INFO_URL = "http://kachai.api/info"
     /** Нарезка файлов YouTube: кусок и число потоков (см. chunkYoutube). */
     private const val YT_CHUNK = 1L shl 20
     private const val YT_PARALLEL = 16
+    /** Откуда брать звук, если отдельной дорожки нет: лучшее видео не выше 720p, иначе любое лучшее. */
+    private const val AUDIO_FROM_VIDEO = "b[height<=720]/b"
     private val ready = CompletableDeferred<Unit>()
 
     private val heightsLadder = listOf(2160, 1440, 1080, 720, 480, 360)
@@ -160,7 +148,6 @@ object Engine {
     /** [cookies] — файл сессии привязанного аккаунта (VK, OK), если есть. */
     suspend fun fetchInfo(
         url: String,
-        proxy: String?,
         cookies: File? = null,
         timeoutMs: Long = LOOKUP_TIMEOUT_MS,
     ): MediaInfo = withContext(Dispatchers.IO) {
@@ -173,21 +160,20 @@ object Engine {
             YoutubeDL.getInstance().destroyProcessById(processId)
         }
         try {
-            useEngine { fetchInfoNow(url, proxy, cookies, processId) }.also { finished = true }
+            useEngine { fetchInfoNow(url, cookies, processId) }.also { finished = true }
         } finally {
             watchdog.cancel()
             if (!finished) YoutubeDL.getInstance().destroyProcessById(processId)
         }
     }
 
-    private fun fetchInfoNow(url: String, proxy: String?, cookies: File?, processId: String): MediaInfo {
+    private fun fetchInfoNow(url: String, cookies: File?, processId: String): MediaInfo {
         val req = YoutubeDLRequest(url)
             .addOption("--no-playlist")
             .addOption("--dump-json")
             .addOption("--socket-timeout", 15)
             .addOption("--retries", 2)
             .addOption("--extractor-retries", 1)
-        proxy?.let { req.addOption("--proxy", it) }
         cookies?.let { req.addOption("--cookies", it.absolutePath) }
         val response = try {
             YoutubeDL.getInstance().execute(req, processId)
@@ -200,38 +186,9 @@ object Engine {
     }
 
     /**
-     * Поиск на нашем сервере — только через туннель ([http] ходит через его прокси).
-     * Там Deno быстро решает JS-защиту YouTube: ~5 с вместо 15–20 на телефоне. Ссылки на файлы
-     * привязаны к IP сервера, поэтому качать их надо тоже через туннель.
-     * Ошибка сайта — [EngineException]; сервер недоступен или занят — [java.io.IOException].
-     */
-    suspend fun fetchInfoRemote(url: String, http: OkHttpClient): MediaInfo = withContext(Dispatchers.IO) {
-        val client = http.newBuilder()
-            .readTimeout(75, TimeUnit.SECONDS)
-            .callTimeout(80, TimeUnit.SECONDS)
-            .build()
-        val body = buildJsonObject { put("url", url) }.toString().toRequestBody("application/json".toMediaType())
-        val request = Request.Builder().url(REMOTE_INFO_URL).post(body).build()
-        client.newCall(request).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            when (resp.code) {
-                200 -> parseInfo(text, url, "remote-" + java.util.UUID.randomUUID())
-                // yt-dlp на сервере не смог — переводим его ошибку так же, как свою
-                422 -> {
-                    val error = runCatching { Json.parseToJsonElement(text).jsonObject["error"]?.jsonPrimitive?.content }
-                        .getOrNull().orEmpty()
-                    throw translate(YoutubeDLException(error))
-                }
-                else -> throw java.io.IOException("lookup server: HTTP ${resp.code}")
-            }
-        }
-    }
-
-    /**
      * YouTube режет скорость каждого запроса, и тем сильнее, чем длиннее запрос: файл целиком не отдаёт,
      * кусок 10 МБ тянется минутами. Поэтому режем его файлы на куски по 1 МБ (&range=, как делает
-     * сам yt-dlp с formats=dashy) и качаем их в [YT_PARALLEL] потоков. На сервере: 108 МБ за 32 с
-     * против «не скачалось за 2 минуты» большими кусками.
+     * сам yt-dlp с formats=dashy) и качаем их в [YT_PARALLEL] потоков.
      * Возвращает новый файл с разбором или null, если резать нечего.
      */
     private fun chunkYoutube(infoJson: File): File? {
@@ -284,33 +241,29 @@ object Engine {
 
     /**
      * Скачать в [outDir]. Возвращает итоговый файл.
-     * [reuseInfo] — взять разбор страницы, сохранённый при поиске, вместо повторного (см. MediaInfo.infoJsonPath).
+     * Разбор страницы берётся сохранённый при поиске, если он есть (см. MediaInfo.infoJsonPath).
      */
     suspend fun download(
         taskId: String,
         info: MediaInfo,
         option: FormatOption,
-        proxy: String?,
         cookies: File?,
         outDir: File,
-        reuseInfo: Boolean,
         onProgress: (Progress) -> Unit,
     ): File = withContext(Dispatchers.IO) {
-        useEngine { downloadNow(taskId, info, option, proxy, cookies, outDir, reuseInfo, onProgress) }
+        useEngine { downloadNow(taskId, info, option, cookies, outDir, onProgress) }
     }
 
     private fun downloadNow(
         taskId: String,
         info: MediaInfo,
         option: FormatOption,
-        proxy: String?,
         cookies: File?,
         outDir: File,
-        reuseInfo: Boolean,
         onProgress: (Progress) -> Unit,
     ): File {
         outDir.mkdirs()
-        val savedInfo = info.infoJsonPath?.let(::File)?.takeIf { reuseInfo && it.exists() }
+        val savedInfo = info.infoJsonPath?.let(::File)?.takeIf { it.exists() }
         val infoJson = savedInfo?.let { runCatching { chunkYoutube(it) }.getOrNull() ?: it }
         val chunked = infoJson != null && infoJson != savedInfo
         if (chunked) Diag.log(TAG, "youtube: ${YT_CHUNK shr 20} MB chunks x$YT_PARALLEL")
@@ -343,7 +296,6 @@ object Engine {
                     "--timeout=15 --connect-timeout=10 --file-allocation=none --summary-interval=1",
             )
         infoJson?.let { req.addOption("--load-info-json", it.absolutePath) }
-        proxy?.let { req.addOption("--proxy", it) }
         cookies?.let { req.addOption("--cookies", it.absolutePath) }
         when (option.kind) {
             FormatOption.Kind.VIDEO -> {
@@ -356,12 +308,15 @@ object Engine {
                 req.addOption("-S", "${res}vcodec:h264,ext:mp4:m4a")
                 req.addOption("--merge-output-format", "mp4")
             }
+            // У сайтов вроде Rutube нет отдельной звуковой дорожки — тогда берём видео со звуком, а -x
+            // вырезает из него звук. Видео не выше 720p: звук там такой же, как в 1080p (проверено побайтово),
+            // а качать меньше. Ниже 720p брать нельзя — у части роликов звук там хуже (70 кбит/с против 195)
             FormatOption.Kind.AUDIO_M4A -> {
-                req.addOption("-f", "ba[ext=m4a]/ba")
+                req.addOption("-f", "ba[ext=m4a]/ba/$AUDIO_FROM_VIDEO")
                 req.addOption("-x").addOption("--audio-format", "m4a")
             }
             FormatOption.Kind.AUDIO_MP3 -> {
-                req.addOption("-f", "ba")
+                req.addOption("-f", "ba/$AUDIO_FROM_VIDEO")
                 req.addOption("-x").addOption("--audio-format", "mp3").addOption("--audio-quality", 2)
             }
         }

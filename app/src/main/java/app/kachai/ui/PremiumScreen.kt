@@ -89,7 +89,7 @@ fun PremiumScreen(vm: MainViewModel, onBack: () -> Unit, onMessage: (String) -> 
             Benefit(Icons.Rounded.HighQuality, "1080p, 2K и 4K", "В бесплатной версии — до ${BuildConfig.FREE_MAX_HEIGHT}p")
             Benefit(Icons.Rounded.AllInclusive, "Без лимита", "Сколько угодно видео в день. Бесплатно — ${BuildConfig.FREE_DAILY_LIMIT} в день")
             Benefit(Icons.Rounded.Block, "Без рекламы", "Совсем: ни баннеров, ни всплывающей рекламы")
-            Benefit(Icons.Rounded.Favorite, "Поддержка сервера", "Подписка оплачивает сервер, через который качают видео")
+            Benefit(Icons.Rounded.Favorite, "Поддержка разработки", "Подписка помогает развивать приложение")
         }
         if (!premium) {
             Spacer(Modifier.height(28.dp))

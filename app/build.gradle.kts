@@ -8,7 +8,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-// Параметры VPS, рекламы и сервера лежат в secrets.properties (не в git).
+// Параметры рекламы, оплаты и статистики лежат в secrets.properties (не в git).
 // Шаблон: secrets.properties.example
 val secrets = Properties().apply {
     val f = rootProject.file("secrets.properties")
@@ -27,20 +27,16 @@ android {
         applicationId = "app.kachai"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.1.9"
+        versionCode = 11
+        versionName = "0.2.0"
 
-        buildConfigField("String", "VPS_HOST", quoted(secret("vps.host")))
-        buildConfigField("int", "VPS_PORT", secret("vps.port", "443"))
-        buildConfigField("String", "VPS_UUID", quoted(secret("vps.uuid")))
-        buildConfigField("String", "VPS_SNI", quoted(secret("vps.sni")))
-        buildConfigField("String", "VPS_PUBLIC_KEY", quoted(secret("vps.publicKey")))
-        buildConfigField("String", "VPS_SHORT_ID", quoted(secret("vps.shortId")))
-        buildConfigField("String", "VPS_FINGERPRINT", quoted(secret("vps.fingerprint", "chrome")))
-        buildConfigField("String", "REMOTE_CONFIG_URL", quoted(secret("remoteConfigUrl")))
         buildConfigField("String", "PREMIUM_URL", quoted(secret("premiumUrl")))
         buildConfigField("String", "API_BASE", quoted(secret("apiBase")))
         buildConfigField("String", "SOURCE_URL", quoted(secret("sourceUrl")))
+        // Адрес политики конфиденциальности (docs/privacy.html, выложенная в интернет) — ссылка в «О приложении»
+        buildConfigField("String", "PRIVACY_URL", quoted(secret("privacyUrl")))
+        // Куда «Отправить отчёт» шлёт письмо с журналом ошибок
+        buildConfigField("String", "SUPPORT_EMAIL", quoted(secret("supportEmail", "alexchalkin97@bk.ru")))
         buildConfigField("int", "FREE_DAILY_LIMIT", secret("freeDailyLimit", "3"))
         // Бесплатная версия качает видео не выше этого разрешения (по короткой стороне кадра)
         buildConfigField("int", "FREE_MAX_HEIGHT", secret("freeMaxHeight", "720"))
@@ -113,16 +109,9 @@ android {
         // библиотеки должны лежать распакованными
         jniLibs.useLegacyPackaging = true
     }
-
-    androidResources {
-        // Базы geoip/geosite из Xray нам не нужны (маршрутизация на сервере), это ~28 МБ
-        ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:.*:<dir>_*:!CVS:!thumbs.db:!picasa.ini:!*~:!geoip.dat:!geoip-only-cn-private.dat:!geosite.dat"
-    }
 }
 
 dependencies {
-    implementation(files("libs/libv2ray.aar"))
-
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
     // aria2c: качает в несколько потоков и сам рвёт «замёрзшие» соединения

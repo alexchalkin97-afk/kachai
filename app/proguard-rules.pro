@@ -1,7 +1,3 @@
-# Xray (gomobile): Java-классы вызываются из Go через JNI
--keep class go.** { *; }
--keep class libv2ray.** { *; }
-
 # youtubedl-android парсит JSON через Jackson в эти классы
 -keep class com.yausername.** { *; }
 -keep class com.fasterxml.jackson.** { *; }

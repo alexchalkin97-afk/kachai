@@ -44,7 +44,6 @@ data class Task(
     /** Сколько уже записано на диск. */
     val downloadedBytes: Long = 0,
     val error: String? = null,
-    val viaVps: Boolean = false,
 )
 
 /** Очередь загрузок и история. Саму работу выполняет [DownloadService]. */

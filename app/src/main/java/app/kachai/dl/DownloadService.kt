@@ -18,10 +18,6 @@ import app.kachai.Stats
 import app.kachai.MainActivity
 import app.kachai.accounts.Accounts
 import app.kachai.R
-import app.kachai.net.Route
-import app.kachai.net.Router
-import app.kachai.net.Tunnel
-import app.kachai.net.TunnelException
 import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,6 +29,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import android.system.Os
 import java.io.File
+import java.util.concurrent.atomic.AtomicReference
 
 /** Фоновый сервис: качает задачи из [Downloads] по одной, пока очередь не опустеет. */
 class DownloadService : Service() {
@@ -73,51 +70,29 @@ class DownloadService : Service() {
     }
 
     private suspend fun process(task: Task) {
-        var route = Router.primary(this, task.info.url)
         val workDir = File(cacheDir, "dl/${task.id}")
-        var attempt = 0
         try {
-            while (true) {
-                attempt++
-                Downloads.update(task.id) {
-                    it.copy(state = TaskState.RUNNING, progress = -1f, error = null, viaVps = route == Route.VPS)
-                }
-                try {
-                    val started = SystemClock.elapsedRealtime()
-                    // Разбор страницы с поиска годится только тем же маршрутом (ссылки YouTube привязаны к IP)
-                    val reuseInfo = attempt == 1 && task.info.lookupViaVps == (route == Route.VPS)
-                    val file = runOnce(task, route, workDir, reuseInfo)
-                    val seconds = (SystemClock.elapsedRealtime() - started) / 1000.0
-                    Diag.log(
-                        "Download", "${task.option.label} via $route: ${file.length() / 1024} KB in ${"%.0f".format(seconds)} s" +
-                            " (${"%.2f".format(file.length() / 1048576.0 / seconds.coerceAtLeast(0.1))} MB/s), reuseInfo=$reuseInfo",
-                    )
-                    val mb = file.length() / 1048576.0
-                    Stats.download(task.info.site, task.option.label, route.name, true, mb, mb / seconds.coerceAtLeast(0.1))
-                    finish(task, file, workDir)
-                    return
-                } catch (e: EngineException) {
-                    val next = if (e.network && attempt < 2) Router.fallback(route, task.info.url) else null
-                    Diag.log("Download", "attempt $attempt via $route failed: ${e.message} | ${e.cause?.message?.lines()?.lastOrNull { it.isNotBlank() }?.take(300)}")
-                    if (next == null) throw e
-                    route = next
-                } catch (e: TunnelException) {
-                    val next = if (attempt < 2) Router.fallback(route, task.info.url) else null
-                    if (next == null) throw EngineException("${e.message}. Попробуйте включить VPN", network = true, e)
-                    route = next
-                }
-                workDir.deleteRecursively()
-            }
+            Downloads.update(task.id) { it.copy(state = TaskState.RUNNING, progress = -1f, error = null) }
+            val started = SystemClock.elapsedRealtime()
+            val file = runOnce(task, workDir)
+            val seconds = (SystemClock.elapsedRealtime() - started) / 1000.0
+            Diag.log(
+                "Download", "${task.option.label}: ${file.length() / 1024} KB in ${"%.0f".format(seconds)} s" +
+                    " (${"%.2f".format(file.length() / 1048576.0 / seconds.coerceAtLeast(0.1))} MB/s)",
+            )
+            val mb = file.length() / 1048576.0
+            Stats.download(task.info.site, task.option.label, true, mb, mb / seconds.coerceAtLeast(0.1))
+            finish(task, file, workDir)
         } catch (e: YoutubeDL.CanceledException) {
             Downloads.fail(task, "Отменено", cancelled = true)
         } catch (e: EngineException) {
-            Diag.log("Download", "failed ${task.option.label}: ${e.message}")
-            Stats.download(task.info.site, task.option.label, route.name, false, error = e.message)
+            Diag.log("Download", "failed ${task.option.label}: ${e.message} | ${e.cause?.message?.lines()?.lastOrNull { it.isNotBlank() }?.take(300)}")
+            Stats.download(task.info.site, task.option.label, false, error = e.message)
             Downloads.fail(task, e.message.orEmpty(), cancelled = false)
             notifyFailed(task, e.message.orEmpty())
         } catch (e: Exception) {
             Diag.log("Download", "crashed ${task.option.label}: $e")
-            Stats.download(task.info.site, task.option.label, route.name, false, error = e.javaClass.simpleName)
+            Stats.download(task.info.site, task.option.label, false, error = e.javaClass.simpleName)
             Downloads.fail(task, "Ошибка: ${e.message}", cancelled = false)
             notifyFailed(task, e.message.orEmpty())
         } finally {
@@ -125,33 +100,31 @@ class DownloadService : Service() {
         }
     }
 
-    private suspend fun runOnce(task: Task, route: Route, workDir: File, reuseInfo: Boolean): File {
-        val proxy = if (route == Route.VPS) Tunnel.acquire(this).httpUrl else null
-        try {
-            val cookies = Accounts.cookiesFor(task.info.url)
-            return coroutineScope {
-                val poller = launch { pollDiskProgress(task, workDir) }
-                try {
-                    Engine.download(task.id, task.info, task.option, proxy, cookies, workDir, reuseInfo) { p ->
-                        Downloads.update(task.id) {
-                            it.copy(
-                                state = if (p.processing) TaskState.PROCESSING else TaskState.RUNNING,
-                                // Процент от yt-dlp берём, только если размер заранее неизвестен:
-                                // иначе его считает pollDiskProgress (aria2c свой прогресс не выводит)
-                                progress = when {
-                                    p.processing -> -1f
-                                    task.option.approxBytes <= 0 && p.percent >= 0 -> p.percent
-                                    else -> it.progress
-                                },
-                            )
-                        }
+    private suspend fun runOnce(task: Task, workDir: File): File {
+        val cookies = Accounts.cookiesFor(task.info.url)
+        // Последний процент от самого yt-dlp; -1 — он его не печатает (так качает aria2c)
+        val enginePercent = AtomicReference(-1f)
+        return coroutineScope {
+            val poller = launch { pollDiskProgress(task, workDir, enginePercent) }
+            try {
+                Engine.download(task.id, task.info, task.option, cookies, workDir) { p ->
+                    if (!p.processing && p.percent >= 0) enginePercent.set(p.percent)
+                    Downloads.update(task.id) {
+                        it.copy(
+                            state = if (p.processing) TaskState.PROCESSING else TaskState.RUNNING,
+                            // Процент от yt-dlp берём, только если размер заранее неизвестен:
+                            // иначе его считает pollDiskProgress (aria2c свой прогресс не выводит)
+                            progress = when {
+                                p.processing -> -1f
+                                task.option.approxBytes <= 0 && p.percent >= 0 -> p.percent
+                                else -> it.progress
+                            },
+                        )
                     }
-                } finally {
-                    poller.cancel()
                 }
+            } finally {
+                poller.cancel()
             }
-        } finally {
-            if (route == Route.VPS) Tunnel.release()
         }
     }
 
@@ -159,7 +132,7 @@ class DownloadService : Service() {
      * Прогресс по тому, сколько реально записано на диск. aria2c пишет файл кусками в разные места,
      * поэтому длина файла обманчива — считаем занятые блоки (st_blocks), это и есть скачанное.
      */
-    private suspend fun pollDiskProgress(task: Task, workDir: File) {
+    private suspend fun pollDiskProgress(task: Task, workDir: File, enginePercent: AtomicReference<Float>) {
         val total = task.option.approxBytes
         var lastBytes = 0L
         var lastAt = SystemClock.elapsedRealtime()
@@ -179,14 +152,22 @@ class DownloadService : Service() {
                 t.copy(
                     downloadedBytes = bytes,
                     speedBps = speed.toLong(),
-                    progress = if (total > 0 && bytes > 0) (bytes * 100f / total).coerceAtMost(99f) else t.progress,
+                    progress = when {
+                        total <= 0 || bytes <= 0 -> t.progress
+                        bytes <= total -> (bytes * 100f / total).coerceAtMost(99f)
+                        // Скачано больше оценки: она бывает занижена (размер посчитан по битрейту, или звук
+                        // вырезается из целого видео). Тогда верим проценту yt-dlp, а без него (-1)
+                        // вместо процента показываем, сколько скачано
+                        else -> enginePercent.get()
+                    },
                     etaSec = if (total > bytes && speed > 1) ((total - bytes) / speed).toLong() else 0,
                 )
             }
             val t = Downloads.tasks.value.find { it.id == task.id } ?: return
             if (now - lastNotifyAt > 700) {
                 lastNotifyAt = now
-                notifyProgress(task.info.title, if (t.state == TaskState.PROCESSING) -1f else t.progress)
+                val processing = t.state == TaskState.PROCESSING
+                notifyProgress(task.info.title, if (processing) -1f else t.progress, processing)
             }
         }
     }
@@ -235,20 +216,27 @@ class DownloadService : Service() {
         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
     )
 
-    private fun progressNotification(title: String, progress: Float) =
+    /** [progress] < 0 — процент неизвестен: идёт постобработка ([processing]) или загрузка без оценки размера. */
+    private fun progressNotification(title: String, progress: Float, processing: Boolean = progress < 0) =
         NotificationCompat.Builder(this, CH_PROGRESS)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
-            .setContentText(if (progress < 0) "Обработка…" else "${progress.toInt()}%")
+            .setContentText(
+                when {
+                    processing -> "Обработка…"
+                    progress < 0 -> "Загрузка…"
+                    else -> "${progress.toInt()}%"
+                },
+            )
             .setProgress(100, progress.toInt().coerceIn(0, 100), progress < 0)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(openAppIntent())
             .build()
 
-    private fun notifyProgress(title: String, progress: Float) {
+    private fun notifyProgress(title: String, progress: Float, processing: Boolean = progress < 0) {
         if (notifications.areNotificationsEnabled()) {
-            runCatching { notifications.notify(NOTIFY_PROGRESS, progressNotification(title, progress)) }
+            runCatching { notifications.notify(NOTIFY_PROGRESS, progressNotification(title, progress, processing)) }
         }
     }
 

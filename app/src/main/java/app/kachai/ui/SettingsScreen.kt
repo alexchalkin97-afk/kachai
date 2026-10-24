@@ -186,10 +186,22 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    RIGHTS_NOTICE,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 TextButton(
                     onClick = { app.kachai.Diag.share(context) },
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
                 ) { Text("Что-то не работает? Отправить отчёт") }
+                if (BuildConfig.PRIVACY_URL.isNotBlank()) {
+                    TextButton(
+                        onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfig.PRIVACY_URL))) },
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+                    ) { Text("Политика конфиденциальности") }
+                }
                 if (BuildConfig.SOURCE_URL.isNotBlank()) {
                     TextButton(
                         onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfig.SOURCE_URL))) },

@@ -78,6 +78,7 @@ fun AppRoot(vm: MainViewModel) {
         }
     }
     LaunchedEffect(Unit) { vm.openDownloads.collect { go(Tab.DOWNLOADS.route) } }
+    LaunchedEffect(Unit) { vm.openHome.collect { go(Tab.HOME.route) } }
 
     fun start() {
         when (vm.startDownload()) {

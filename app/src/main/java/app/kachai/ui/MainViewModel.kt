@@ -20,10 +20,6 @@ import app.kachai.dl.EngineException
 import app.kachai.dl.FormatOption
 import app.kachai.dl.LinkResolver
 import app.kachai.dl.MediaInfo
-import app.kachai.net.Route
-import app.kachai.net.Router
-import app.kachai.net.Tunnel
-import app.kachai.net.TunnelException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -34,7 +30,7 @@ import kotlinx.coroutines.launch
 sealed interface Lookup {
     data object Idle : Lookup
     data object Loading : Lookup
-    data class Ready(val info: MediaInfo, val viaVps: Boolean) : Lookup
+    data class Ready(val info: MediaInfo) : Lookup
     /** [loginSite] — видео откроется после входа в этот аккаунт: предлагаем привязать. */
     /** [reloginSite] — аккаунт привязан, но сайт его не пустил: предлагаем войти заново. */
     data class Failed(val message: String, val loginSite: Site? = null, val reloginSite: Site? = null) : Lookup
@@ -61,16 +57,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val videoHeight = k.prefs.videoHeight.stateIn(viewModelScope, SharingStarted.Eagerly, 1080)
     val audioMp3 = k.prefs.audioMp3.stateIn(viewModelScope, SharingStarted.Eagerly, false)
     val linkedAccounts = Accounts.linked
-    val vpnOn = Router.vpnFlow(app).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     /** Открыть вкладку «Загрузки» (из уведомления). */
     val openDownloads = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /** Открыть главный экран: туда пришла ссылка через «Поделиться». */
+    val openHome = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
     private var lookupJob: Job? = null
 
     fun onShared(text: String) {
         val url = extractUrl(text) ?: return
         input = url
+        openHome.tryEmit(Unit)
         find()
     }
 
@@ -94,34 +93,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // Клипы OK превращаем в ссылку VK (см. LinkResolver)
             val url = LinkResolver.resolve(raw)
             if (url != raw) input = url
-            var route = Router.primary(k, url)
             for (attempt in 1..2) {
                 val started = System.currentTimeMillis()
-                Diag.log("Lookup", "${Diag.short(url)} route=$route vpn=${Router.isVpnActive(k)} attempt=$attempt")
+                Diag.log("Lookup", "${Diag.short(url)} attempt=$attempt")
                 try {
-                    val info = fetch(url, route).copy(lookupViaVps = route == Route.VPS)
+                    val info = Engine.fetchInfo(url, Accounts.cookiesFor(url))
                     Diag.log("Lookup", "ok in ${System.currentTimeMillis() - started}ms, ${info.options.size} options")
-                    Stats.lookup(info.site, route.name, lastLookupWhere, true, System.currentTimeMillis() - started)
-                    lookup = Lookup.Ready(info, route == Route.VPS)
+                    Stats.lookup(info.site, true, System.currentTimeMillis() - started)
+                    lookup = Lookup.Ready(info)
                     selected = pickDefault(
                         info.options, audioByDefault.value, videoHeight.value, audioMp3.value, maxVideoHeight(),
                     )
                     return@launch
                 } catch (e: EngineException) {
                     Diag.log("Lookup", "failed in ${System.currentTimeMillis() - started}ms: ${e.message}")
-                    Stats.lookup(siteOf(url), route.name, lastLookupWhere, false, System.currentTimeMillis() - started, e.message)
+                    Stats.lookup(siteOf(url), false, System.currentTimeMillis() - started, e.message)
                     if (e.needsLogin) { lookup = loginFailure(url, e); return@launch }
-                    // Другого маршрута нет — пробуем тем же ещё раз: сайты вроде Дзена иногда отдают
-                    // вместо страницы промежуточную (проверку, перенаправление), со второго раза проходит
-                    val next = if (e.network && attempt == 1) Router.fallback(route, url) ?: route else null
-                    if (next == null) { lookup = Lookup.Failed(e.message.orEmpty()); return@launch }
-                    if (next == route) kotlinx.coroutines.delay(2000)
-                    route = next
-                } catch (e: TunnelException) {
-                    Diag.log("Lookup", "tunnel failed: ${e.message}")
-                    val next = if (attempt == 1) Router.fallback(route, url) else null
-                    if (next == null) { lookup = Lookup.Failed("${e.message}. Попробуйте включить VPN"); return@launch }
-                    route = next
+                    // Пробуем ещё раз: сайты вроде Дзена иногда отдают вместо страницы
+                    // промежуточную (проверку, перенаправление), со второго раза проходит
+                    if (!e.network || attempt == 2) { lookup = Lookup.Failed(e.message.orEmpty()); return@launch }
+                    kotlinx.coroutines.delay(2000)
                 } catch (e: Exception) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     lookup = Lookup.Failed("Не получилось открыть ссылку")
@@ -131,38 +122,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Где нашли видео в последний раз — для статистики: server или phone. */
-    private var lastLookupWhere = "phone"
-
     /** Сайт по адресу ссылки (без пути) — для статистики неудачных поисков. */
     private fun siteOf(url: String) = runCatching { java.net.URI(url).host?.removePrefix("www.")?.removePrefix("m.") }
         .getOrNull() ?: "?"
-
-    private suspend fun fetch(url: String, route: Route): MediaInfo {
-        lastLookupWhere = "phone"
-        val cookies = Accounts.cookiesFor(url)
-        if (route == Route.DIRECT) return Engine.fetchInfo(url, null, cookies)
-        val ep = Tunnel.acquire(k)
-        try {
-            // Быстрый поиск на сервере; не ответил — ищем на телефоне, как раньше.
-            // С куками аккаунта — только на телефоне: сессию на сервер не отправляем
-            if (cookies == null) {
-                val started = System.currentTimeMillis()
-                lastLookupWhere = "server"
-                try {
-                    return Engine.fetchInfoRemote(url, k.http).also {
-                        Diag.log("Lookup", "server ok in ${System.currentTimeMillis() - started}ms")
-                    }
-                } catch (e: java.io.IOException) {
-                    Diag.log("Lookup", "server failed in ${System.currentTimeMillis() - started}ms: ${e.message}, trying on phone")
-                    lastLookupWhere = "phone"
-                }
-            }
-            return Engine.fetchInfo(url, ep.socksUrl, cookies)
-        } finally {
-            Tunnel.release()
-        }
-    }
 
     private fun loginFailure(url: String, e: EngineException): Lookup.Failed {
         val site = Accounts.siteFor(url) ?: return Lookup.Failed(e.message.orEmpty())

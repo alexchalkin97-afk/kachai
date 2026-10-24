@@ -157,7 +157,7 @@ private fun statusLine(t: Task): String = when (t.state) {
         when {
             t.progress >= 0 -> append("${t.progress.toInt()}%")
             t.downloadedBytes > 0 -> append(formatBytes(t.downloadedBytes))
-            else -> append(if (t.viaVps) "Подключаемся к серверу…" else "Подготовка…")
+            else -> append("Подготовка…")
         }
         formatSpeed(t.speedBps).takeIf { it.isNotEmpty() }?.let { append(" · $it") }
         formatEta(t.etaSec).takeIf { it.isNotEmpty() && t.progress >= 0 }?.let { append(" · ещё $it") }
@@ -179,9 +179,7 @@ fun SectionTitle(text: String, modifier: Modifier = Modifier) {
     )
 }
 
-@Composable
-fun Dot(color: Color) {
-    Box(Modifier.size(8.dp).clip(CircleShape).background(color))
-}
-
 val ScreenPadding = Arrangement.spacedBy(12.dp)
+
+/** Напоминание об авторских правах: на главном экране и в «О приложении». */
+const val RIGHTS_NOTICE = "Используйте только видео, на которые у вас есть права, или в рамках допустимого цитирования."

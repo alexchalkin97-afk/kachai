@@ -25,17 +25,17 @@ object Stats {
         }
     }
 
-    /** Поиск видео. [where] — server (наш сервер), phone (yt-dlp на телефоне). */
-    fun lookup(site: String, route: String, where: String, ok: Boolean, ms: Long, error: String? = null) = event(
+    /** Поиск видео по ссылке. */
+    fun lookup(site: String, ok: Boolean, ms: Long, error: String? = null) = event(
         "lookup",
-        "site" to site, "route" to route, "where" to where, "ok" to ok,
+        "site" to site, "ok" to ok,
         "seconds" to bucket(ms / 1000.0), "error" to error,
     )
 
-    fun download(site: String, quality: String, route: String, ok: Boolean, mb: Double = 0.0, mbps: Double = 0.0, error: String? = null) =
+    fun download(site: String, quality: String, ok: Boolean, mb: Double = 0.0, mbps: Double = 0.0, error: String? = null) =
         event(
             "download",
-            "site" to site, "quality" to quality, "route" to route, "ok" to ok,
+            "site" to site, "quality" to quality, "ok" to ok,
             "size_mb" to bucket(mb), "speed_mbps" to "%.1f".format(mbps), "error" to error,
         )
 

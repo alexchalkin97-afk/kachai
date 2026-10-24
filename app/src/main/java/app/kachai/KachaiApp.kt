@@ -10,8 +10,6 @@ import app.kachai.billing.RuStoreBilling
 import app.kachai.data.Prefs
 import app.kachai.dl.Downloads
 import app.kachai.dl.Engine
-import app.kachai.net.Tunnel
-import app.kachai.net.VpsConfig
 import coil3.ImageLoader
 import coil3.PlatformContext
 import coil3.SingletonImageLoader
@@ -21,13 +19,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import okhttp3.Credentials
-import okhttp3.OkHttpClient
-import java.io.IOException
-import java.net.Proxy
-import java.net.ProxySelector
-import java.net.SocketAddress
-import java.net.URI
 import java.util.UUID
 
 class KachaiApp : Application(), SingletonImageLoader.Factory {
@@ -57,11 +48,8 @@ class KachaiApp : Application(), SingletonImageLoader.Factory {
         Downloads.load(this)
         Accounts.init(this)
         Downloads.onRefund = { scope.launch { quota.refund() } }
-        VpsConfig.load(this)
         Ads.init(this)
 
-        // Свежие настройки туннеля — параллельно распаковке движка, чтобы успеть до первого поиска
-        scope.launch(Dispatchers.IO) { VpsConfig.refresh(this@KachaiApp) }
         scope.launch(Dispatchers.IO) {
             Engine.init(this@KachaiApp)
             updateEngineIfDue()
@@ -84,25 +72,8 @@ class KachaiApp : Application(), SingletonImageLoader.Factory {
             .onFailure { Log.w("KachaiApp", "engine update: ${it.message}") }
     }
 
-    /** Превью грузятся через туннель, если он поднят (иначе YouTube-картинки могут не открыться). */
-    val http: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .proxySelector(object : ProxySelector() {
-                override fun select(uri: URI?): List<Proxy> = listOf(Tunnel.endpoint?.httpProxy ?: Proxy.NO_PROXY)
-                override fun connectFailed(uri: URI?, sa: SocketAddress?, ioe: IOException?) = Unit
-            })
-            .proxyAuthenticator { _, response ->
-                val ep = Tunnel.endpoint ?: return@proxyAuthenticator null
-                if (response.request.header("Proxy-Authorization") != null) return@proxyAuthenticator null
-                response.request.newBuilder()
-                    .header("Proxy-Authorization", Credentials.basic(ep.user, ep.pass))
-                    .build()
-            }
-            .build()
-    }
-
     override fun newImageLoader(context: PlatformContext): ImageLoader =
         ImageLoader.Builder(context)
-            .components { add(OkHttpNetworkFetcherFactory(callFactory = { http })) }
+            .components { add(OkHttpNetworkFetcherFactory()) }
             .build()
 }

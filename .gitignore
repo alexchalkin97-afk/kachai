@@ -6,14 +6,14 @@ local.properties
 .kotlin/
 captures/
 
-# Секреты: параметры VPS и ключи подписи
+# Секреты: ключи рекламы, оплаты и подписи
 secrets.properties
 *.jks
 *.keystore
 signing.properties
 
-# Скачивается скриптом scripts/fetch-libs.sh
-app/libs/*.aar
-
-# Готовые APK для раздачи
-dist/
+# Готовые сборки и код тестировщика — не в git; материалы для RuStore — в git
+dist/*
+!dist/rustore/
+# HTML-кадры мокапов собирает make_mockups.py из template.html
+dist/rustore/mockups/0*.html
