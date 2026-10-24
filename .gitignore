@@ -1,0 +1,19 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+
+# Секреты: параметры VPS и ключи подписи
+secrets.properties
+*.jks
+*.keystore
+signing.properties
+
+# Скачивается скриптом scripts/fetch-libs.sh
+app/libs/*.aar
+
+# Готовые APK для раздачи
+dist/

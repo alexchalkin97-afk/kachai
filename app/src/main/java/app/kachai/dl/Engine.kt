@@ -1,0 +1,491 @@
+package app.kachai.dl
+
+import android.content.Context
+import android.util.Log
+import com.yausername.aria2c.Aria2c
+import com.yausername.ffmpeg.FFmpeg
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLException
+import com.yausername.youtubedl_android.YoutubeDLRequest
+import com.yausername.youtubedl_android.mapper.VideoFormat
+import com.yausername.youtubedl_android.mapper.VideoInfo
+import app.kachai.Diag
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.ObjectNode
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+/** Что нашли по ссылке. */
+@Serializable
+data class MediaInfo(
+    val url: String,
+    val id: String,
+    val title: String,
+    val uploader: String?,
+    val durationSec: Int,
+    val thumbnail: String?,
+    val site: String,
+    val options: List<FormatOption>,
+    /**
+     * Ответ yt-dlp при поиске. Загрузка берёт его через --load-info-json и не разбирает страницу
+     * заново (через сервер это лишние ~15 с «подключения»). Ссылки на файлы у YouTube привязаны
+     * к IP, поэтому годится только для того же маршрута, каким шёл поиск ([lookupViaVps]).
+     */
+    val infoJsonPath: String? = null,
+    val lookupViaVps: Boolean = false,
+)
+
+/** Вариант загрузки, который видит пользователь. */
+@Serializable
+data class FormatOption(
+    val kind: Kind,
+    /** Высота кадра для видео; null — «лучшее, что есть». */
+    val height: Int? = null,
+    val approxBytes: Long = 0,
+    /** Конкретный видеоформат yt-dlp: так разрешение не окажется выше выбранного. */
+    val formatId: String? = null,
+) {
+    enum class Kind { VIDEO, AUDIO_M4A, AUDIO_MP3 }
+
+    /** Стабильный ключ для «качества по умолчанию» в настройках. */
+    val key: String
+        get() = when (kind) {
+            Kind.VIDEO -> "v${height ?: "best"}"
+            Kind.AUDIO_M4A -> "m4a"
+            Kind.AUDIO_MP3 -> "mp3"
+        }
+
+    val label: String
+        get() = when (kind) {
+            Kind.VIDEO -> when (height) {
+                null -> "Лучшее"
+                2160 -> "4K"
+                1440 -> "2K"
+                else -> "${height}p"
+            }
+            Kind.AUDIO_M4A -> "M4A"
+            Kind.AUDIO_MP3 -> "MP3"
+        }
+}
+
+/**
+ * Ошибка с понятным текстом. [network] — стоит попробовать другой маршрут,
+ * [needsLogin] — сайт отдаёт видео только вошедшим в аккаунт.
+ */
+class EngineException(
+    message: String,
+    val network: Boolean,
+    cause: Throwable? = null,
+    val needsLogin: Boolean = false,
+) : Exception(message, cause)
+
+/** Обёртка над yt-dlp (youtubedl-android): Python, ffmpeg и QuickJS уже внутри библиотеки. */
+object Engine {
+    private const val TAG = "Engine"
+    private const val LOOKUP_TIMEOUT_MS = 75_000L
+    /** Адрес службы поиска внутри туннеля: Xray на сервере ведёт его на 127.0.0.1:8090 (server/setup-api.sh). */
+    private const val REMOTE_INFO_URL = "http://kachai.api/info"
+    /** Нарезка файлов YouTube: кусок и число потоков (см. chunkYoutube). */
+    private const val YT_CHUNK = 1L shl 20
+    private const val YT_PARALLEL = 16
+    private val ready = CompletableDeferred<Unit>()
+
+    private val heightsLadder = listOf(2160, 1440, 1080, 720, 480, 360)
+
+    private lateinit var infoDir: File
+
+    /** Распаковка Python занимает несколько секунд при первом запуске — делаем это в фоне. */
+    fun init(context: Context) {
+        infoDir = File(context.cacheDir, "info").apply { mkdirs() }
+        try {
+            YoutubeDL.getInstance().init(context)
+            FFmpeg.getInstance().init(context)
+            Aria2c.getInstance().init(context)
+            ready.complete(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "init failed", e)
+            ready.completeExceptionally(e)
+        }
+    }
+
+    suspend fun awaitReady() = ready.await()
+
+    fun version(context: Context): String? = YoutubeDL.getInstance().versionName(context)
+
+    /**
+     * Обновление заменяет файл yt-dlp, а Python читает его по ходу работы.
+     * Поэтому обновление ждёт, пока закончатся текущие запуски, а новые ждут конца обновления.
+     */
+    private val updateGate = Mutex()
+    private val running = AtomicInteger(0)
+
+    private suspend fun <T> useEngine(block: suspend () -> T): T {
+        awaitReady()
+        updateGate.withLock { running.incrementAndGet() }
+        try {
+            return block()
+        } finally {
+            running.decrementAndGet()
+        }
+    }
+
+    /** Обновить yt-dlp с GitHub. Возвращает true, если поставлена новая версия. */
+    suspend fun update(context: Context): Boolean = withContext(Dispatchers.IO) {
+        awaitReady()
+        updateGate.withLock {
+            while (running.get() > 0) delay(500)
+            YoutubeDL.getInstance().updateYoutubeDL(context, YoutubeDL.UpdateChannel.STABLE) ==
+                YoutubeDL.UpdateStatus.DONE
+        }
+    }
+
+    /** [cookies] — файл сессии привязанного аккаунта (VK, OK), если есть. */
+    suspend fun fetchInfo(
+        url: String,
+        proxy: String?,
+        cookies: File? = null,
+        timeoutMs: Long = LOOKUP_TIMEOUT_MS,
+    ): MediaInfo = withContext(Dispatchers.IO) {
+        // yt-dlp при плохой сети может ждать бесконечно — сторож убивает процесс по таймауту
+        val processId = "info-" + java.util.UUID.randomUUID()
+        var finished = false
+        val watchdog = launch {
+            delay(timeoutMs)
+            Diag.log(TAG, "lookup timeout after ${timeoutMs / 1000}s, killing yt-dlp")
+            YoutubeDL.getInstance().destroyProcessById(processId)
+        }
+        try {
+            useEngine { fetchInfoNow(url, proxy, cookies, processId) }.also { finished = true }
+        } finally {
+            watchdog.cancel()
+            if (!finished) YoutubeDL.getInstance().destroyProcessById(processId)
+        }
+    }
+
+    private fun fetchInfoNow(url: String, proxy: String?, cookies: File?, processId: String): MediaInfo {
+        val req = YoutubeDLRequest(url)
+            .addOption("--no-playlist")
+            .addOption("--dump-json")
+            .addOption("--socket-timeout", 15)
+            .addOption("--retries", 2)
+            .addOption("--extractor-retries", 1)
+        proxy?.let { req.addOption("--proxy", it) }
+        cookies?.let { req.addOption("--cookies", it.absolutePath) }
+        val response = try {
+            YoutubeDL.getInstance().execute(req, processId)
+        } catch (e: YoutubeDL.CanceledException) {
+            throw EngineException("Сайт слишком долго не отвечает. Проверьте интернет или включите VPN", network = true, e)
+        } catch (e: YoutubeDLException) {
+            throw translate(e)
+        }
+        return parseInfo(response.out, url, processId)
+    }
+
+    /**
+     * Поиск на нашем сервере — только через туннель ([http] ходит через его прокси).
+     * Там Deno быстро решает JS-защиту YouTube: ~5 с вместо 15–20 на телефоне. Ссылки на файлы
+     * привязаны к IP сервера, поэтому качать их надо тоже через туннель.
+     * Ошибка сайта — [EngineException]; сервер недоступен или занят — [java.io.IOException].
+     */
+    suspend fun fetchInfoRemote(url: String, http: OkHttpClient): MediaInfo = withContext(Dispatchers.IO) {
+        val client = http.newBuilder()
+            .readTimeout(75, TimeUnit.SECONDS)
+            .callTimeout(80, TimeUnit.SECONDS)
+            .build()
+        val body = buildJsonObject { put("url", url) }.toString().toRequestBody("application/json".toMediaType())
+        val request = Request.Builder().url(REMOTE_INFO_URL).post(body).build()
+        client.newCall(request).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            when (resp.code) {
+                200 -> parseInfo(text, url, "remote-" + java.util.UUID.randomUUID())
+                // yt-dlp на сервере не смог — переводим его ошибку так же, как свою
+                422 -> {
+                    val error = runCatching { Json.parseToJsonElement(text).jsonObject["error"]?.jsonPrimitive?.content }
+                        .getOrNull().orEmpty()
+                    throw translate(YoutubeDLException(error))
+                }
+                else -> throw java.io.IOException("lookup server: HTTP ${resp.code}")
+            }
+        }
+    }
+
+    /**
+     * YouTube режет скорость каждого запроса, и тем сильнее, чем длиннее запрос: файл целиком не отдаёт,
+     * кусок 10 МБ тянется минутами. Поэтому режем его файлы на куски по 1 МБ (&range=, как делает
+     * сам yt-dlp с formats=dashy) и качаем их в [YT_PARALLEL] потоков. На сервере: 108 МБ за 32 с
+     * против «не скачалось за 2 минуты» большими кусками.
+     * Возвращает новый файл с разбором или null, если резать нечего.
+     */
+    private fun chunkYoutube(infoJson: File): File? {
+        val mapper = YoutubeDL.objectMapper
+        val root = mapper.readTree(infoJson) as? ObjectNode ?: return null
+        var changed = false
+        fun chunk(f: JsonNode) {
+            val fmt = f as? ObjectNode ?: return
+            val url = fmt.path("url").asText("")
+            val size = fmt.path("filesize").asLong(0)
+            if (fmt.path("protocol").asText() != "https" || size <= 0 || "googlevideo.com" !in url) return
+            val sep = if ('?' in url) '&' else '?'
+            fmt.remove("downloader_options")
+            fmt.put("protocol", "http_dash_segments")
+            val fragments = fmt.putArray("fragments")
+            var start = 0L
+            while (start < size) {
+                val end = minOf(start + YT_CHUNK, size) - 1
+                fragments.addObject().put("url", "$url${sep}range=$start-$end")
+                start += YT_CHUNK
+            }
+            changed = true
+        }
+        root.path("formats").forEach(::chunk)
+        root.path("requested_formats").forEach(::chunk)
+        if (!changed) return null
+        return File(infoJson.parentFile, infoJson.nameWithoutExtension + ".chunked.json")
+            .apply { mapper.writeValue(this, root) }
+    }
+
+    private fun parseInfo(json: String, url: String, fileId: String): MediaInfo {
+        val info = runCatching { YoutubeDL.objectMapper.readValue(json, VideoInfo::class.java) }
+            .getOrElse { throw EngineException("Не получилось разобрать ответ сайта", network = false, it) }
+        val infoFile = runCatching { File(infoDir, "$fileId.json").apply { writeText(json) } }.getOrNull()
+        return MediaInfo(
+            infoJsonPath = infoFile?.absolutePath,
+            url = info.webpageUrl ?: url,
+            id = info.id ?: url.hashCode().toString(),
+            title = info.title ?: info.fulltitle ?: "Без названия",
+            uploader = info.uploader,
+            durationSec = info.duration,
+            thumbnail = info.thumbnail,
+            site = info.extractorKey ?: info.extractor ?: "",
+            options = buildOptions(info.formats.orEmpty(), info.duration),
+        )
+    }
+
+    /** Прогресс загрузки: процент (-1 — неизвестно), секунд до конца, скорость в байтах/с, идёт ли постобработка. */
+    data class Progress(val percent: Float, val etaSec: Long, val bytesPerSec: Long, val processing: Boolean)
+
+    /**
+     * Скачать в [outDir]. Возвращает итоговый файл.
+     * [reuseInfo] — взять разбор страницы, сохранённый при поиске, вместо повторного (см. MediaInfo.infoJsonPath).
+     */
+    suspend fun download(
+        taskId: String,
+        info: MediaInfo,
+        option: FormatOption,
+        proxy: String?,
+        cookies: File?,
+        outDir: File,
+        reuseInfo: Boolean,
+        onProgress: (Progress) -> Unit,
+    ): File = withContext(Dispatchers.IO) {
+        useEngine { downloadNow(taskId, info, option, proxy, cookies, outDir, reuseInfo, onProgress) }
+    }
+
+    private fun downloadNow(
+        taskId: String,
+        info: MediaInfo,
+        option: FormatOption,
+        proxy: String?,
+        cookies: File?,
+        outDir: File,
+        reuseInfo: Boolean,
+        onProgress: (Progress) -> Unit,
+    ): File {
+        outDir.mkdirs()
+        val savedInfo = info.infoJsonPath?.let(::File)?.takeIf { reuseInfo && it.exists() }
+        val infoJson = savedInfo?.let { runCatching { chunkYoutube(it) }.getOrNull() ?: it }
+        val chunked = infoJson != null && infoJson != savedInfo
+        if (chunked) Diag.log(TAG, "youtube: ${YT_CHUNK shr 20} MB chunks x$YT_PARALLEL")
+        // С --load-info-json ссылку не передаём: иначе yt-dlp разберёт страницу ещё раз
+        val req = (if (infoJson != null) YoutubeDLRequest(emptyList()) else YoutubeDLRequest(info.url))
+            .addOption("--no-playlist")
+            // Каждое обновление прогресса — отдельной строкой: без этого yt-dlp пишет его через \r,
+            // библиотека ждёт перевода строки, и процент в приложение не доходит
+            .addOption("--newline")
+            .addOption("--no-mtime")
+            .addOption("--socket-timeout", 20)
+            .addOption("--retries", 5)
+            .addOption("--fragment-retries", 10)
+            // Пропущенный кусок — битое видео; лучше честная ошибка
+            .addOption("--abort-on-unavailable-fragments")
+            .addOption("-N", if (chunked) YT_PARALLEL else 4)
+            .addOption("-o", File(outDir, "%(title).120B.%(ext)s").absolutePath)
+            .addOption("--write-thumbnail")
+            .addOption("--convert-thumbnails", "jpg")
+            .addOption("-o", "thumbnail:" + File(outDir, "thumb.%(ext)s").absolutePath)
+        // Обычные файлы качает aria2c: 8 потоков по 1 МБ, «замёрзший» поток (<50 КБ/с) рвёт
+        // и переоткрывает. Под ТСПУ одно соединение то и дело подвисает — так скорость не падает до нуля.
+        // HLS-плейлисты и нарезанный YouTube (см. chunkYoutube) — встроенному загрузчику.
+        req.addOption("--downloader", "libaria2c.so")
+            .addOption("--downloader", "m3u8:native")
+            .addOption("--downloader", "dash:native")
+            .addOption(
+                "--downloader-args",
+                "aria2c:-x 8 -s 8 -k 1M --lowest-speed-limit=50K --max-tries=0 --retry-wait=1 " +
+                    "--timeout=15 --connect-timeout=10 --file-allocation=none --summary-interval=1",
+            )
+        infoJson?.let { req.addOption("--load-info-json", it.absolutePath) }
+        proxy?.let { req.addOption("--proxy", it) }
+        cookies?.let { req.addOption("--cookies", it.absolutePath) }
+        when (option.kind) {
+            FormatOption.Kind.VIDEO -> {
+                // Если формат выбран заранее — берём именно его (со звуком отдельно или без),
+                // иначе — сортировка: сначала высота, потом H.264 и mp4, их играют даже старые телефоны
+                // Запасное «bv*+ba/b» — если поиск был на сервере, а разбор заново на телефоне:
+                // там другие клиенты YouTube и такого номера формата может не быть, тогда решает -S
+                option.formatId?.let { id -> req.addOption("-f", "$id+ba/$id/bv*+ba/b") }
+                val res = option.height?.let { "res:$it," }.orEmpty()
+                req.addOption("-S", "${res}vcodec:h264,ext:mp4:m4a")
+                req.addOption("--merge-output-format", "mp4")
+            }
+            FormatOption.Kind.AUDIO_M4A -> {
+                req.addOption("-f", "ba[ext=m4a]/ba")
+                req.addOption("-x").addOption("--audio-format", "m4a")
+            }
+            FormatOption.Kind.AUDIO_MP3 -> {
+                req.addOption("-f", "ba")
+                req.addOption("-x").addOption("--audio-format", "mp3").addOption("--audio-quality", 2)
+            }
+        }
+        // Прогресс от aria2c yt-dlp печатает в stderr, а библиотека разбирает только stdout —
+        // поэтому сливаем потоки. Тогда и текст ошибки приходит в общий поток: храним хвост сами
+        val tail = ArrayDeque<String>()
+        try {
+            YoutubeDL.getInstance().execute(req, taskId, redirectErrorStream = true) { progress, eta, line ->
+                if (line.isNotBlank()) {
+                    if (tail.size >= 30) tail.removeFirst()
+                    tail.addLast(line)
+                }
+                val post = line.startsWith("[Merger]") || line.startsWith("[ExtractAudio]") ||
+                    line.startsWith("[VideoConvertor]") || line.startsWith("[FixupM")
+                onProgress(Progress(progress, eta, parseSpeed(line), post))
+            }
+        } catch (e: YoutubeDL.CanceledException) {
+            throw e
+        } catch (e: YoutubeDLException) {
+            val message = e.message?.takeIf { it.isNotBlank() } ?: tail.joinToString("\n")
+            throw translate(YoutubeDLException(message))
+        }
+        return outDir.listFiles()
+            ?.filter { it.isFile && !it.name.startsWith("thumb.") && !it.name.endsWith(".part") }
+            ?.maxByOrNull { it.length() }
+            ?: throw EngineException("Файл не найден после загрузки", network = false)
+    }
+
+    // aria2c: «DL:2.1MiB», yt-dlp: «at 2.10MiB/s»
+    private val speedRegex = Regex("""(?:DL:|\sat\s+)([\d.]+)([KMG]i)?B""")
+
+    private fun parseSpeed(line: String): Long {
+        val m = speedRegex.find(line) ?: return -1
+        val value = m.groupValues[1].toDoubleOrNull() ?: return -1
+        val mult = when (m.groupValues[2]) { "Ki" -> 1024.0; "Mi" -> 1024.0 * 1024; "Gi" -> 1024.0 * 1024 * 1024; else -> 1.0 }
+        return (value * mult).toLong()
+    }
+
+    fun cancel(taskId: String) {
+        YoutubeDL.getInstance().destroyProcessById(taskId)
+    }
+
+    private fun buildOptions(formats: List<VideoFormat>, durationSec: Int): List<FormatOption> {
+        val audio = formats.filter { it.vcodec == "none" && it.acodec != null && it.acodec != "none" }
+        val bestAudio = audio.filter { it.ext == "m4a" }.maxByOrNull { it.abr }
+            ?: audio.maxByOrNull { it.abr }
+        val audioBytes = bestAudio?.let { sizeOf(it, durationSec) } ?: 0L
+
+        val video = formats.filter { it.height > 0 && it.vcodec != null && it.vcodec != "none" }
+        val maxHeight = video.maxOfOrNull { shortSide(it) } ?: 0
+
+        val videoOptions = if (maxHeight == 0) {
+            listOf(FormatOption(FormatOption.Kind.VIDEO, null))
+        } else {
+            heightsLadder.filter { it <= maxHeight }.ifEmpty { listOf(maxHeight) }.map { h ->
+                val candidates = video.filter { shortSide(it) in (h * 3 / 4 + 1)..h }
+                // Сначала обычный файл (его aria2c качает в 8 потоков), а не HLS-плейлист; среди них — H.264
+                val pick = candidates.maxWithOrNull(
+                    compareBy<VideoFormat>(
+                        { it.manifestUrl == null },
+                        { it.vcodec?.startsWith("avc") == true },
+                        { it.tbr },
+                    )
+                )
+                val hasAudio = pick?.acodec != null && pick.acodec != "none"
+                val bytes = pick?.let { sizeOf(it, durationSec) + if (hasAudio) 0 else audioBytes } ?: 0
+                FormatOption(FormatOption.Kind.VIDEO, h, bytes, pick?.formatId)
+            }
+        }
+        val audioOptions = if (audio.isNotEmpty() || maxHeight > 0) listOf(
+            FormatOption(FormatOption.Kind.AUDIO_M4A, approxBytes = audioBytes),
+            // --audio-quality 2 даёт VBR около 190 кбит/с
+            FormatOption(FormatOption.Kind.AUDIO_MP3, approxBytes = 190_000L / 8 * durationSec),
+        ) else emptyList()
+        return videoOptions + audioOptions
+    }
+
+    /**
+     * «1080p» — это короткая сторона кадра: у вертикального 1080×1920 тоже 1080p.
+     * Так же считает yt-dlp в -S res:N, поэтому выбор и подпись совпадают.
+     */
+    private fun shortSide(f: VideoFormat): Int =
+        if (f.width > 0) minOf(f.width, f.height) else f.height
+
+    /** У HLS-потоков YouTube размера нет — тогда считаем по битрейту (кбит/с) и длительности. */
+    private fun sizeOf(f: VideoFormat, durationSec: Int): Long = when {
+        f.fileSize > 0 -> f.fileSize
+        f.fileSizeApproximate > 0 -> f.fileSizeApproximate
+        else -> f.tbr.toLong() * 1000 / 8 * durationSec
+    }
+
+    /** Перевести ошибку yt-dlp в понятную человеку. */
+    private fun translate(e: YoutubeDLException): EngineException {
+        val m = e.message.orEmpty()
+        Diag.log(TAG, "yt-dlp error: " + m.lines().filter { it.isNotBlank() }.takeLast(6).joinToString(" | ").take(1500))
+        fun has(vararg s: String) = s.any { m.contains(it, ignoreCase = true) }
+        return when {
+            // OK отправляет гостей на страницу входа — yt-dlp видит её как «Unsupported URL»
+            has("st.cmd=anonymMain") ->
+                EngineException("Это видео доступно только после входа в аккаунт", network = false, e, needsLogin = true)
+            has("Unsupported URL") ->
+                EngineException("Эта ссылка не поддерживается", network = false, e)
+            has("restricted by the community", "access to this clip has been restricted", "access to this video has been restricted") ->
+                EngineException("Автор ограничил доступ к этому видео — скачать его нельзя", network = false, e)
+            has("Private video", "This video is private") ->
+                EngineException("Видео закрыто автором", network = false, e)
+            has("Video unavailable", "This video is not available", "has been removed") ->
+                EngineException("Видео недоступно или удалено", network = false, e)
+            has("confirm your age", "age-restricted", "Sign in to confirm your age") ->
+                EngineException("Видео 18+: YouTube не отдаёт его без входа в аккаунт", network = false, e)
+            has("Sign in to confirm you", "not a bot") ->
+                EngineException("YouTube принял нас за бота. Попробуйте через пару минут", network = true, e)
+            // «Доступ ограничен» — так VK отвечает на видео с закрытой страницы, если для него мы гость
+            has("login required", "rate-limit reached", "Requested content is not available",
+                "only available to signed-in users", "available for registered users",
+                "Доступ ограничен", "Access denied", "Access restricted") ->
+                EngineException("Это видео доступно только после входа в аккаунт", network = false, e, needsLogin = true)
+            has("HTTP Error 403", "Forbidden") ->
+                EngineException("Сайт отказал в доступе. Попробуйте ещё раз", network = true, e)
+            has("timed out", "Connection refused", "Connection reset", "Network is unreachable",
+                "Unable to connect", "Failed to establish", "Temporary failure in name resolution",
+                "Name or service not known", "ProxyError", "SOCKS", "Read timed out") ->
+                EngineException("Нет соединения с сайтом", network = true, e)
+            else -> EngineException("Не получилось скачать. Попробуйте ещё раз", network = true, e)
+        }
+    }
+}

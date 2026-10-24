@@ -1,0 +1,217 @@
+package app.kachai.ui
+
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.AllInclusive
+import androidx.compose.material.icons.rounded.Block
+import androidx.compose.material.icons.rounded.Favorite
+import androidx.compose.material.icons.rounded.HighQuality
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.kachai.BuildConfig
+import app.kachai.Stats
+import kotlinx.coroutines.launch
+
+@Composable
+fun PremiumScreen(vm: MainViewModel, onBack: () -> Unit, onMessage: (String) -> Unit, modifier: Modifier = Modifier) {
+    val premium by vm.isPremium.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    var codeDialog by remember { mutableStateOf(false) }
+    var buying by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) { Stats.premiumOpened() }
+
+    Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
+        IconButton(onClick = onBack, modifier = Modifier.padding(top = 8.dp)) {
+            Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Назад")
+        }
+        Spacer(Modifier.height(16.dp))
+        Box(
+            Modifier.size(64.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primaryContainer),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.Rounded.Star, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp))
+        }
+        Spacer(Modifier.height(20.dp))
+        Text("Качай Плюс", style = MaterialTheme.typography.headlineMedium)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            if (premium) "Подписка активна. Спасибо, что поддерживаете приложение!"
+            else "Ежемесячная подписка. Отменить можно в любой момент.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(28.dp))
+
+        Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
+            Benefit(Icons.Rounded.HighQuality, "1080p, 2K и 4K", "В бесплатной версии — до ${BuildConfig.FREE_MAX_HEIGHT}p")
+            Benefit(Icons.Rounded.AllInclusive, "Без лимита", "Сколько угодно видео в день. Бесплатно — ${BuildConfig.FREE_DAILY_LIMIT} в день")
+            Benefit(Icons.Rounded.Block, "Без рекламы", "Совсем: ни баннеров, ни всплывающей рекламы")
+            Benefit(Icons.Rounded.Favorite, "Поддержка сервера", "Подписка оплачивает сервер, через который качают видео")
+        }
+        if (!premium) {
+            Spacer(Modifier.height(28.dp))
+            Text(BuildConfig.PREMIUM_PRICE, style = MaterialTheme.typography.headlineSmall)
+        }
+
+        Spacer(Modifier.height(36.dp))
+        if (!premium) {
+            // Оплата через RuStore; если её нет в сборке — страница оплаты по ссылке
+            val canPay = vm.canBuyInApp || BuildConfig.PREMIUM_URL.isNotBlank()
+            Button(
+                onClick = {
+                    if (vm.canBuyInApp) {
+                        buying = true
+                        scope.launch {
+                            vm.buyPlus()
+                                .onSuccess { onMessage("Спасибо! Плюс активирован") }
+                                .onFailure { onMessage("Оплата не завершена") }
+                            buying = false
+                        }
+                    } else {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfig.PREMIUM_URL)))
+                    }
+                },
+                enabled = canPay && !buying,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = MaterialTheme.shapes.medium,
+            ) {
+                Text(
+                    when {
+                        buying -> "Открываем оплату…"
+                        canPay -> "Оформить за ${BuildConfig.PREMIUM_PRICE}"
+                        else -> "Оплата скоро появится"
+                    }
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = { codeDialog = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("У меня есть код")
+            }
+        } else if (vm.canBuyInApp) {
+            // Отменить подписку из приложения SDK не даёт — открываем «Профиль → Подписки» в RuStore
+            OutlinedButton(
+                onClick = { openRuStoreSubscriptions(context) },
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = MaterialTheme.shapes.medium,
+            ) {
+                Text("Отменить или изменить подписку")
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Подписка оформлена в RuStore, там же она отменяется. После отмены Плюс работает до конца оплаченного месяца.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+
+    if (codeDialog) {
+        CodeDialog(vm, onDismiss = { codeDialog = false }, onMessage = onMessage)
+    }
+}
+
+/** Экран подписок в RuStore (rustore.ru/help/sdk/rustore-deeplinks); без RuStore — страница с инструкцией. */
+private fun openRuStoreSubscriptions(context: Context) {
+    try {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("rustore://profile/subscriptions")))
+    } catch (e: ActivityNotFoundException) {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://www.rustore.ru/help/users/purchases-and-returns/subscription-management")),
+        )
+    }
+}
+
+@Composable
+private fun Benefit(icon: ImageVector, title: String, text: String) {
+    Row {
+        Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
+        Spacer(Modifier.width(16.dp))
+        Column {
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun CodeDialog(vm: MainViewModel, onDismiss: () -> Unit, onMessage: (String) -> Unit) {
+    var code by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text("Код подписки") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = code, onValueChange = { code = it; error = null },
+                    singleLine = true, isError = error != null,
+                    placeholder = { Text("XXXX-XXXX-XXXX") },
+                    supportingText = error?.let { { Text(it) } },
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = code.isNotBlank() && !busy,
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        vm.activatePremium(code)
+                            .onSuccess { onMessage("Плюс активирован"); onDismiss() }
+                            .onFailure { error = it.message ?: "Не получилось" }
+                        busy = false
+                    }
+                },
+            ) {
+                if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Text("Активировать")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Отмена") } },
+    )
+}
