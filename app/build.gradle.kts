@@ -63,8 +63,11 @@ android {
             reset()
             // x86_64 — только для эмулятора: в релиз (и в универсальный APK для RuStore) его не кладём,
             // иначе файл почти вдвое тяжелее ради процессоров, которых у телефонов почти не бывает
-            val release = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
-            if (release) include("arm64-v8a", "armeabi-v7a") else include("arm64-v8a", "armeabi-v7a", "x86_64")
+            // -Pemulator: та же релизная сборка, но под процессор эмулятора — посмотреть приложение глазами
+            // пользователя. Такой APK только для эмулятора, в магазин его не отдавать
+            val forPhones = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) } &&
+                !project.hasProperty("emulator")
+            if (forPhones) include("arm64-v8a", "armeabi-v7a") else include("arm64-v8a", "armeabi-v7a", "x86_64")
             // Универсальный APK — для RuStore без передачи ключа подписи (AAB он требует вместе с ключом)
             isUniversalApk = true
         }
@@ -124,7 +127,9 @@ android {
 // который собирает все архитектуры из зависимостей, не глядя на список в splits
 androidComponents {
     onVariants(selector().withBuildType("release")) { variant ->
-        variant.packaging.jniLibs.excludes.addAll(listOf("lib/x86/**", "lib/x86_64/**"))
+        if (!project.hasProperty("emulator")) {
+            variant.packaging.jniLibs.excludes.addAll(listOf("lib/x86/**", "lib/x86_64/**"))
+        }
     }
 }
 
