@@ -19,6 +19,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import kotlinx.serialization.Serializable
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -153,7 +156,12 @@ object Engine {
 
     private suspend fun <T> useEngine(block: suspend () -> T): T {
         awaitReady()
-        updateGate.withLock { running.incrementAndGet() }
+        // Обновление может зависнуть (GitHub медленный или недоступен без VPN) — тогда не ждём его
+        // дольше UPDATE_WAIT_MS и работаем прежней версией: поиск важнее свежего движка
+        if (withTimeoutOrNull(UPDATE_WAIT_MS) { updateGate.withLock { running.incrementAndGet() } } == null) {
+            Diag.log(TAG, "engine update still running, using current version")
+            running.incrementAndGet()
+        }
         try {
             return block()
         } finally {
@@ -161,9 +169,24 @@ object Engine {
         }
     }
 
+    private const val UPDATE_WAIT_MS = 20_000L
+
+    const val COMMUNITY_CLOSED = "Сообщество закрыло этот клип: его видят только участники"
+
+    /** Доступен ли GitHub, откуда приходит обновление: короткий запрос вместо долгого зависания. */
+    private fun githubReachable(): Boolean = runCatching {
+        OkHttpClient.Builder().callTimeout(8, TimeUnit.SECONDS).build()
+            .newCall(Request.Builder().url("https://github.com/yt-dlp/yt-dlp/releases/latest").head().build())
+            .execute().use { it.code < 500 }
+    }.getOrDefault(false)
+
     /** Обновить yt-dlp с GitHub. Возвращает true, если поставлена новая версия. */
     suspend fun update(context: Context): Boolean = withContext(Dispatchers.IO) {
         awaitReady()
+        if (!githubReachable()) {
+            Diag.log(TAG, "engine update skipped: GitHub unreachable")
+            throw java.io.IOException("GitHub недоступен")
+        }
         updateGate.withLock {
             while (running.get() > 0) delay(500)
             YoutubeDL.getInstance().updateYoutubeDL(context, YoutubeDL.UpdateChannel.STABLE) ==
@@ -249,7 +272,7 @@ object Engine {
         val info = runCatching { YoutubeDL.objectMapper.readValue(json, VideoInfo::class.java) }
             .getOrElse { throw EngineException("Не получилось разобрать ответ сайта", network = false, it) }
         val infoFile = runCatching { File(infoDir, "$fileId.json").apply { writeText(json) } }.getOrNull()
-        val video = info.formats.orEmpty().filter { it.height > 0 && it.vcodec != null && it.vcodec != "none" }
+        val video = info.formats.orEmpty().filter { it.height > 0 && it.vcodec != "none" }
         val best = video.maxWithOrNull(compareBy({ minOf(it.width, it.height).takeIf { w -> w > 0 } ?: it.height }, { it.tbr }))
         // Instagram и некоторые другие сайты длительность не сообщают — без неё нет ни фрагмента, ни оценки
         // размера. Тогда спрашиваем ffmpeg: он читает её из заголовка видео, не скачивая файл
@@ -498,7 +521,7 @@ object Engine {
             ?: audio.maxByOrNull { it.abr }
         val audioBytes = bestAudio?.let { sizeOf(it, durationSec) } ?: 0L
 
-        val video = formats.filter { it.height > 0 && it.vcodec != null && it.vcodec != "none" }
+        val video = formats.filter { it.height > 0 && it.vcodec != "none" }
         val maxHeight = video.maxOfOrNull { shortSide(it) } ?: 0
 
         val videoOptions = if (maxHeight == 0) {
@@ -596,8 +619,12 @@ object Engine {
                 EngineException("Это видео доступно только после входа в аккаунт", network = false, e, needsLogin = true)
             has("Unsupported URL") ->
                 EngineException("Эта ссылка не поддерживается", network = false, e)
-            has("restricted by the community", "access to this clip has been restricted", "access to this video has been restricted") ->
-                EngineException("Автор ограничил доступ к этому видео — скачать его нельзя", network = false, e)
+            // VK отвечает на языке аккаунта: гостю по-английски, вошедшему — по-русски
+            has("restricted by the community", "access to this clip has been restricted", "access to this video has been restricted",
+                "ограничен руководителями сообщества", "Доступ к клипу ограничен") ->
+                // Сообщество (в VK или OK — клипы у них общие) пускает к клипу только участников:
+                // вошедший участник скачать сможет, поэтому предлагаем вход
+                EngineException(COMMUNITY_CLOSED, network = false, e, needsLogin = true)
             has("Private video", "This video is private") ->
                 EngineException("Видео закрыто автором", network = false, e)
             has("Video unavailable", "This video is not available", "has been removed") ->
@@ -615,7 +642,7 @@ object Engine {
                 EngineException("Сайт отказал в доступе. Попробуйте ещё раз", network = true, e)
             has("timed out", "Connection refused", "Connection reset", "Network is unreachable",
                 "Unable to connect", "Failed to establish", "Temporary failure in name resolution",
-                "Name or service not known", "ProxyError", "SOCKS", "Read timed out") ->
+                "Name or service not known", "No address associated with hostname", "ProxyError", "SOCKS", "Read timed out") ->
                 EngineException("Нет соединения с сайтом", network = true, e)
             else -> EngineException("Не получилось скачать. Попробуйте ещё раз", network = true, e)
         }

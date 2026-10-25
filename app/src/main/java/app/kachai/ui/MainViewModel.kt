@@ -172,9 +172,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         section = null
         clipboardHint = null
         lookupJob = viewModelScope.launch {
-            // Клипы OK превращаем в ссылку VK (см. LinkResolver)
-            val url = LinkResolver.resolve(raw)
-            if (url != raw) input = url
+            // Клипы OK — это клипы VK с теми же номерами (см. LinkResolver). Но клипы групп OK бывают
+            // закрыты в VK — тогда при входе в OK берём клип из самого OK. Ссылку в поле не подменяем
+            val okClip = LinkResolver.isOkClipUrl(raw)
+            val url = Accounts.cookiesFor(raw)?.takeIf { okClip }?.let { LinkResolver.okClipAsVideo(raw, it) }
+                ?: LinkResolver.resolve(raw)
             for (attempt in 1..2) {
                 val started = System.currentTimeMillis()
                 Diag.log("Lookup", "${Diag.short(url)} attempt=$attempt")
@@ -190,7 +192,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (e: EngineException) {
                     Diag.log("Lookup", "failed in ${System.currentTimeMillis() - started}ms: ${e.message}")
                     Stats.lookup(siteOf(url), false, System.currentTimeMillis() - started, e.message)
-                    if (e.needsLogin) { lookup = loginFailure(url, e); return@launch }
+                    // Ссылка из OK — и вход предлагаем в OK, даже если искали копию в VK
+                    if (e.needsLogin) { lookup = loginFailure(url, e, site = if (okClip) Site.OK else null); return@launch }
                     // Пробуем ещё раз: сайты вроде Дзена иногда отдают вместо страницы
                     // промежуточную (проверку, перенаправление), со второго раза проходит
                     if (!e.network || attempt == 2) { lookup = Lookup.Failed(e.message.orEmpty()); return@launch }
@@ -208,8 +211,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private fun siteOf(url: String) = runCatching { java.net.URI(url).host?.removePrefix("www.")?.removePrefix("m.") }
         .getOrNull() ?: "?"
 
-    private fun loginFailure(url: String, e: EngineException): Lookup.Failed {
-        val site = Accounts.siteFor(url) ?: return Lookup.Failed(e.message.orEmpty())
+    private fun loginFailure(url: String, e: EngineException, site: Site? = null): Lookup.Failed {
+        val site = site ?: Accounts.siteFor(url) ?: return Lookup.Failed(e.message.orEmpty())
+        if (e.message == Engine.COMMUNITY_CLOSED) {
+            return if (Accounts.isLinked(site)) {
+                Lookup.Failed("${e.message}. С вашим аккаунтом ${site.title} доступа нет — вы не участник сообщества", reloginSite = site)
+            } else {
+                Lookup.Failed("${e.message}. Если вы участник — войдите во ${site.title}", loginSite = site)
+            }
+        }
         return if (Accounts.isLinked(site)) {
             // VK так же отвечает и на удалённые ролики, но и сессия могла устареть
             Lookup.Failed(
@@ -313,10 +323,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         private val urlRegex = Regex("""https?://\S+""")
+        private val invisibleRegex = Regex("""[\p{Cc}\p{Cf}  ]""")
         private val bareRegex = Regex("""(?:www\.|m\.)?[a-z0-9-]+\.[a-z]{2,}/\S+""", RegexOption.IGNORE_CASE)
 
         fun extractUrl(text: String): String? {
-            val t = text.trim()
+            // Невидимые символы из буфера (нулевой, нулевой ширины, метки направления) ломают запуск
+            // yt-dlp («invalid null character») — заменяем их пробелом, он и так граница ссылки
+            val t = text.replace(invisibleRegex, " ").trim()
             urlRegex.find(t)?.let { return it.value.trimEnd('.', ',', ')', '»', '"') }
             bareRegex.find(t)?.let { return "https://" + it.value }
             return null

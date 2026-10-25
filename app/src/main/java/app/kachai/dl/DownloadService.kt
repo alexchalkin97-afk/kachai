@@ -118,7 +118,8 @@ class DownloadService : Service() {
                                 p.processing -> -1f
                                 // У фрагмента процент yt-dlp идёт по каждой дорожке отдельно (видео 0→100, звук
                                 // снова 0→100) — полоса прыгала бы. Для него только байты на диске
-                                task.option.approxBytes <= 0 && task.section == null && p.percent >= 0 -> p.percent
+                                task.option.approxBytes <= 0 && task.section == null && p.percent >= 0 ->
+                                    maxOf(it.progress, p.percent)
                                 else -> it.progress
                             },
                         )
@@ -143,29 +144,39 @@ class DownloadService : Service() {
         var lastBytes = 0L
         var lastAt = SystemClock.elapsedRealtime()
         var speed = 0.0
+        // Скачано больше оценки — дальше процент не считаем, чтобы полоса не прыгала туда-обратно
+        var overEstimate = false
         while (true) {
             delay(1000)
-            val bytes = workDir.listFiles().orEmpty()
+            // HLS качается кусками: yt-dlp пишет их отдельными файлами, потом дописывает в общий и удаляет.
+            // В этот момент на диске на миг становится меньше — поэтому объём берём не меньше прежнего,
+            // иначе проценты и скорость скачут (2 → 3 → 2 → 3)
+            val measured = workDir.listFiles().orEmpty()
                 .filter { it.isFile && !it.name.startsWith("thumb.") && !it.name.endsWith(".aria2") }
                 .sumOf { f -> runCatching { Os.stat(f.absolutePath).st_blocks * 512 }.getOrDefault(f.length()) }
+            val bytes = maxOf(measured, lastBytes)
             val now = SystemClock.elapsedRealtime()
             val instant = (bytes - lastBytes).coerceAtLeast(0) * 1000.0 / (now - lastAt).coerceAtLeast(1)
             speed = if (speed == 0.0) instant else speed * 0.6 + instant * 0.4
             lastBytes = bytes
             lastAt = now
+            if (total in 1 until bytes) overEstimate = true
             Downloads.update(task.id) { t ->
                 if (t.state != TaskState.RUNNING) return@update t
+                val next = when {
+                    total <= 0 || bytes <= 0 -> t.progress
+                    !overEstimate -> (bytes * 100f / total).coerceAtMost(99f)
+                    // Скачано больше оценки: она бывает занижена (размер посчитан по битрейту, или звук
+                    // вырезается из целого видео). Тогда верим проценту yt-dlp, а без него (-1)
+                    // вместо процента показываем, сколько скачано. У фрагмента — сразу второе
+                    task.section == null && enginePercent.get() >= 0 -> enginePercent.get()
+                    else -> -1f
+                }
                 t.copy(
                     downloadedBytes = bytes,
                     speedBps = speed.toLong(),
-                    progress = when {
-                        total <= 0 || bytes <= 0 -> t.progress
-                        bytes <= total -> (bytes * 100f / total).coerceAtMost(99f)
-                        // Скачано больше оценки: она бывает занижена (размер посчитан по битрейту, или звук
-                        // вырезается из целого видео). Тогда верим проценту yt-dlp, а без него (-1)
-                        // вместо процента показываем, сколько скачано. У фрагмента — сразу второе
-                        else -> if (task.section != null) -1f else enginePercent.get()
-                    },
+                    // Процент только растёт; -1 («сколько скачано») — раз и до конца
+                    progress = if (next >= 0 && t.progress >= 0) maxOf(t.progress, next) else next,
                     etaSec = if (total > bytes && speed > 1) ((total - bytes) / speed).toLong() else 0,
                 )
             }

@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.os.Message
+import android.widget.FrameLayout
 import android.net.Uri
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
@@ -104,7 +106,8 @@ class LoginActivity : ComponentActivity() {
                         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
                         AndroidView(
                             modifier = Modifier.fillMaxSize(),
-                            factory = { ctx -> createWebView(ctx) },
+                            // Контейнер: поверх страницы входа открываются всплывающие окна («Войти через VK»)
+                            factory = { ctx -> FrameLayout(ctx).also { box -> box.addView(createWebView(ctx, box)) } },
                         )
                     }
                 }
@@ -113,7 +116,7 @@ class LoginActivity : ComponentActivity() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun createWebView(ctx: Context) = WebView(ctx).apply {
+    private fun createWebView(ctx: Context, box: FrameLayout) = WebView(ctx).apply {
         // Без явного MATCH_PARENT WebView считает свою высоту «по содержимому», и в CSS 100vh = 0:
         // страница входа VK (она вся на vh) схлопывается, поле для кода уезжает за верх экрана
         layoutParams = android.view.ViewGroup.LayoutParams(
@@ -122,23 +125,49 @@ class LoginActivity : ComponentActivity() {
         )
         // В отладочной сборке страницу можно смотреть через chrome://inspect
         if (app.kachai.BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
-        settings.javaScriptEnabled = true
-        settings.domStorageEnabled = true
-        settings.databaseEnabled = true
-        settings.javaScriptCanOpenWindowsAutomatically = true
-        // Притворяемся обычным Chrome: по метке «wv» сайты узнают встроенный браузер
-        // и пытаются отправить подтверждение входа в своё приложение — у нас оно не откроется
-        settings.userAgentString = settings.userAgentString
-            .replace("; wv)", ")")
-            .replace(Regex("""Version/\d+\.\d+ """), "")
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+        setupBrowser(this)
+        // Вход в OK «через VK» открывает VK ID во всплывающем окне и ждёт от него ответа (window.opener).
+        // Без поддержки окон WebView его не открывает, и страница бесконечно крутит загрузку
+        settings.setSupportMultipleWindows(true)
         Diag.log(TAG, "open ${site.name}, ${settings.userAgentString.substringAfter("Chrome/").substringBefore(' ')}")
         webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
                 if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
                     Diag.log(TAG, "console: ${message.message().take(200)}")
                 }
+                return true
+            }
+
+            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
+                val popup = WebView(view.context).apply {
+                    layoutParams = android.view.ViewGroup.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                    setupBrowser(this)
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageStarted(v: WebView, url: String?, favicon: Bitmap?) {
+                            Diag.log(TAG, "popup ${Diag.short(url)}")
+                        }
+
+                        // Как в основном окне: ссылки на приложения (vk://, intent://) у нас не откроются
+                        override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
+                            val url = request.url
+                            if (url.scheme == "http" || url.scheme == "https") return false
+                            url.getQueryParameter("browser_fallback_url")?.let(v::loadUrl)
+                            return true
+                        }
+                    }
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onCloseWindow(window: WebView) {
+                            Diag.log(TAG, "popup closed")
+                            closePopup(box, window)
+                        }
+                    }
+                }
+                box.addView(popup)
+                (resultMsg.obj as WebView.WebViewTransport).webView = popup
+                resultMsg.sendToTarget()
                 return true
             }
         }
@@ -187,6 +216,26 @@ class LoginActivity : ComponentActivity() {
                 if (Accounts.looksLoggedIn(site, url)) afterLogin(this@apply)
             }
         }
+    }
+
+    /** Общие настройки основного окна и всплывающих: JS, хранилище, куки, вид обычного Chrome. */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun setupBrowser(view: WebView) {
+        view.settings.javaScriptEnabled = true
+        view.settings.domStorageEnabled = true
+        view.settings.javaScriptCanOpenWindowsAutomatically = true
+        // Притворяемся обычным Chrome: по метке «wv» сайты узнают встроенный браузер
+        // и пытаются отправить подтверждение входа в своё приложение — у нас оно не откроется
+        view.settings.userAgentString = view.settings.userAgentString
+            .replace("; wv)", ")")
+            .replace(Regex("""Version/\d+\.\d+ """), "")
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
+    }
+
+    private fun closePopup(box: FrameLayout, popup: WebView) {
+        box.removeView(popup)
+        popup.destroy()
     }
 
     private fun afterLogin(view: WebView) {

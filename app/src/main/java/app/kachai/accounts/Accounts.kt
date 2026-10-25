@@ -34,6 +34,8 @@ enum class Site(
 }
 
 private val VK_SESSION = setOf("remixsid", "remixnsid")
+/** Кука сессии вошедшего в OK. */
+private val OK_SESSION = setOf("AUTHCODE")
 /** С ней vk.com перенаправляет на vk.ru, и POST-запрос yt-dlp теряет параметры. */
 private const val VK_REDIRECT_COOKIE = "REDIRECT_TO_VK_RU"
 
@@ -50,6 +52,9 @@ object Accounts {
 
     fun init(context: Context) {
         dir = File(context.filesDir, "accounts").apply { mkdirs() }
+        // Прежние версии могли «привязать» OK гостевыми куками — такую привязку забываем
+        file(Site.OK).takeIf { f -> f.exists() && OK_SESSION.none { name -> f.readText().contains("\t$name\t") } }
+            ?.let { it.delete(); Diag.log("Accounts", "ok: guest cookies removed") }
         refresh()
     }
 
@@ -107,7 +112,11 @@ object Accounts {
         }
         val noCookies = lines.size == 1
         val vkWithoutSession = site == Site.VK && !looksLoggedIn(site, null)
-        if (noCookies || vkWithoutSession) return false
+        // У гостя OK тоже есть куки (JSESSIONID, счётчики) — привязан, только если есть сессия входа.
+        // Вход в OK идёт через VK ID, и если его не закончить, без этой проверки сохранились бы гостевые куки
+        val okWithoutSession = site == Site.OK && byHost.values.none { c -> OK_SESSION.any { it in c } }
+        if (site == Site.OK) Diag.log("Accounts", "ok session: ${!okWithoutSession}")
+        if (noCookies || vkWithoutSession || okWithoutSession) return false
         file(site).writeText(lines.joinToString("\n", postfix = "\n"))
         refresh()
         return true
