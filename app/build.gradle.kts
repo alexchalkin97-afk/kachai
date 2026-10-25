@@ -27,8 +27,8 @@ android {
         applicationId = "app.kachai"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.2.0"
+        versionCode = 12
+        versionName = "0.3.0"
 
         buildConfigField("String", "PREMIUM_URL", quoted(secret("premiumUrl")))
         buildConfigField("String", "API_BASE", quoted(secret("apiBase")))
@@ -40,7 +40,7 @@ android {
         buildConfigField("int", "FREE_DAILY_LIMIT", secret("freeDailyLimit", "3"))
         // Бесплатная версия качает видео не выше этого разрешения (по короткой стороне кадра)
         buildConfigField("int", "FREE_MAX_HEIGHT", secret("freeMaxHeight", "720"))
-        buildConfigField("String", "PREMIUM_PRICE", quoted(secret("premiumPrice", "349 ₽ в месяц")))
+        buildConfigField("String", "PREMIUM_PRICE", quoted(secret("premiumPrice", "99 ₽ в месяц")))
         // Код тестировщика включает Плюс без оплаты. В APK попадает только хэш, не сам код
         val testerCode = secret("testerCode").trim().uppercase()
         buildConfigField("String", "TESTER_CODE_HASH", quoted(if (testerCode.isEmpty()) "" else sha256(testerCode)))
@@ -55,6 +55,15 @@ android {
         buildConfigField("String", "RUSTORE_APP_ID", quoted(rustoreAppId))
         buildConfigField("String", "APPMETRICA_KEY", quoted(secret("appmetrica.apiKey")))
         buildConfigField("String", "RUSTORE_SUBSCRIPTION_ID", quoted(secret("rustore.subscriptionId", "subsribe")))
+        // Другие тарифы Плюса: годовая подписка и разовый Плюс на месяц / год (потребляемые товары).
+        // Пустой ID — тарифа нет, экран покажет только то, что заведено в Консоли
+        buildConfigField("String", "RUSTORE_YEARLY_ID", quoted(secret("rustore.yearlyId")))
+        buildConfigField("String", "RUSTORE_PASS_MONTH_ID", quoted(secret("rustore.passMonthId")))
+        buildConfigField("String", "RUSTORE_PASS_YEAR_ID", quoted(secret("rustore.passYearId")))
+        // Открытый ключ для проверки промокодов (tools/promo). Пустой — промокоды выключены
+        buildConfigField("String", "PROMO_PUBLIC_KEY", quoted(secret("promo.publicKey")))
+        // Канал или группа приложения в соцсетях — ссылка в настройках; пустая — пункта нет
+        buildConfigField("String", "COMMUNITY_URL", quoted(secret("communityUrl")))
     }
 
     splits {
@@ -144,6 +153,8 @@ dependencies {
     implementation("com.yandex.android:mobileads:8.5.0")
     implementation("io.appmetrica.analytics:analytics:8.6.0")
     implementation("ru.rustore.sdk:pay:11.1.0")
+    // Окно «Оцените приложение» прямо в приложении: оценка уходит в RuStore
+    implementation("ru.rustore.sdk:review:10.5.2")
 
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")

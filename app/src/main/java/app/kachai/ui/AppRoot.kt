@@ -102,6 +102,11 @@ fun AppRoot(vm: MainViewModel) {
                 )
                 if (result == SnackbarResult.ActionPerformed) openFile(context, top)
             }
+            // Пока плашка видна, не перебиваем её окном оценки
+            launch {
+                kotlinx.coroutines.delay(4000)
+                vm.maybeAskReview(activity)
+            }
         }
     }
 

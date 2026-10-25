@@ -17,6 +17,7 @@ import app.kachai.KachaiApp
 import app.kachai.Stats
 import app.kachai.accounts.Accounts
 import app.kachai.accounts.Site
+import app.kachai.billing.Plan
 import app.kachai.data.Prefs
 import app.kachai.data.ThemeMode
 import app.kachai.dl.ClipSection
@@ -281,6 +282,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun addReward() = viewModelScope.launch { k.quota.addReward() }
 
+    fun maybeAskReview(activity: android.app.Activity) = viewModelScope.launch { app.kachai.Review.maybeAsk(activity, k.prefs) }
+
     fun setThemeMode(m: ThemeMode) = viewModelScope.launch { k.prefs.setThemeMode(m) }
     fun setAudioByDefault(v: Boolean) = viewModelScope.launch { k.prefs.setAudioByDefault(v) }
     fun setVideoHeight(v: Int) = viewModelScope.launch { k.prefs.setVideoHeight(v) }
@@ -295,7 +298,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Оплата через RuStore доступна в этой сборке. */
     val canBuyInApp get() = k.rustore.enabled
 
-    suspend fun buyPlus(): Result<Boolean> = k.rustore.purchase().also { Stats.purchase(it.isSuccess) }
+    /** Тарифы Плюса из RuStore; пусто — пока не загрузились или RuStore их не отдал (тогда одна подписка). */
+    var plans by mutableStateOf<List<Plan>>(emptyList())
+        private set
+
+    fun loadPlans() = viewModelScope.launch { plans = k.rustore.plans() }
+
+    suspend fun buyPlus(plan: Plan? = null): Result<Boolean> =
+        (if (plan != null) k.rustore.purchase(plan.id) else k.rustore.purchase())
+            .also { Stats.purchase(it.isSuccess, plan?.kind?.name) }
 
     fun purchaseError(e: Throwable): String = k.rustore.errorText(e)
 
@@ -314,7 +325,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateEngine(onDone: (String) -> Unit) = viewModelScope.launch {
         engineUpdating = true
-        val msg = runCatching { if (Engine.update(k)) "Движок обновлён" else "Уже последняя версия" }
+        val msg = runCatching { if (Engine.update(k, manual = true)) "Движок обновлён" else "Уже последняя версия" }
             .getOrElse { "Не удалось обновить: ${it.message}" }
         engineVersion = Engine.version(k)
         engineUpdating = false
@@ -330,9 +341,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // Невидимые символы из буфера (нулевой, нулевой ширины, метки направления) ломают запуск
             // yt-dlp («invalid null character») — заменяем их пробелом, он и так граница ссылки
             val t = text.replace(invisibleRegex, " ").trim()
-            urlRegex.find(t)?.let { return it.value.trimEnd('.', ',', ')', '»', '"') }
-            bareRegex.find(t)?.let { return "https://" + it.value }
-            return null
+            val url = urlRegex.find(t)?.value?.trimEnd('.', ',', ')', '»', '"')
+                ?: bareRegex.find(t)?.let { "https://" + it.value }
+                ?: return null
+            return LinkResolver.clean(url)
         }
 
         /**

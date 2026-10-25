@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -50,6 +51,14 @@ class Prefs(context: Context) {
         val PREMIUM_UNTIL = longPreferencesKey("premium_until")
         val PREMIUM_TOKEN = stringPreferencesKey("premium_token")
         val DEBUG_PREMIUM = intPreferencesKey("debug_premium")
+        /** Плюс без автопродления, купленный в RuStore разово (на месяц или год). */
+        val PASS_UNTIL = longPreferencesKey("pass_until")
+        /** Плюс по промокоду и номера кодов, уже активированных на этом телефоне. */
+        val PROMO_UNTIL = longPreferencesKey("promo_until")
+        val PROMO_USED = stringSetPreferencesKey("promo_used")
+        /** Сколько загрузок прошло успешно и просили ли уже оценку в RuStore. */
+        val DOWNLOADS_DONE = intPreferencesKey("downloads_done")
+        val REVIEW_ASKED = intPreferencesKey("review_asked")
 
         val QUOTA_DAY = stringPreferencesKey("quota_day")
         val QUOTA_USED = intPreferencesKey("quota_used")

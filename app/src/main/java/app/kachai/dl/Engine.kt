@@ -10,6 +10,7 @@ import com.yausername.youtubedl_android.YoutubeDLRequest
 import com.yausername.youtubedl_android.mapper.VideoFormat
 import com.yausername.youtubedl_android.mapper.VideoInfo
 import app.kachai.Diag
+import app.kachai.Stats
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.node.ObjectNode
 import kotlinx.coroutines.launch
@@ -126,12 +127,15 @@ object Engine {
     private val heightsLadder = listOf(2160, 1440, 1080, 720, 480, 360)
 
     private lateinit var infoDir: File
+    /** Папка с заплатками для yt-dlp (см. VK_FIX); null — записать не удалось, работаем без них. */
+    private var pluginDir: File? = null
     private lateinit var appContext: Context
 
     /** Распаковка Python занимает несколько секунд при первом запуске — делаем это в фоне. */
     fun init(context: Context) {
         appContext = context.applicationContext
         infoDir = File(context.cacheDir, "info").apply { mkdirs() }
+        pluginDir = runCatching { writeVkFix(context) }.onFailure { Log.e(TAG, "vk fix not written", it) }.getOrNull()
         try {
             YoutubeDL.getInstance().init(context)
             FFmpeg.getInstance().init(context)
@@ -180,18 +184,27 @@ object Engine {
             .execute().use { it.code < 500 }
     }.getOrDefault(false)
 
-    /** Обновить yt-dlp с GitHub. Возвращает true, если поставлена новая версия. */
-    suspend fun update(context: Context): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * Обновить yt-dlp с GitHub. Возвращает true, если поставлена новая версия.
+     * Итог уходит в статистику: по доле «GitHub недоступен» решаем, нужно ли своё зеркало обновлений.
+     */
+    suspend fun update(context: Context, manual: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         awaitReady()
+        val trigger = if (manual) "manual" else "auto"
         if (!githubReachable()) {
             Diag.log(TAG, "engine update skipped: GitHub unreachable")
+            Stats.engineUpdate("github_unreachable", trigger, version(context))
             throw java.io.IOException("GitHub недоступен")
         }
-        updateGate.withLock {
-            while (running.get() > 0) delay(500)
-            YoutubeDL.getInstance().updateYoutubeDL(context, YoutubeDL.UpdateChannel.STABLE) ==
-                YoutubeDL.UpdateStatus.DONE
-        }
+        runCatching {
+            updateGate.withLock {
+                while (running.get() > 0) delay(500)
+                YoutubeDL.getInstance().updateYoutubeDL(context, YoutubeDL.UpdateChannel.STABLE) ==
+                    YoutubeDL.UpdateStatus.DONE
+            }
+        }.onSuccess { Stats.engineUpdate(if (it) "updated" else "up_to_date", trigger, version(context)) }
+            .onFailure { Stats.engineUpdate("failed", trigger, version(context), it.message) }
+            .getOrThrow()
     }
 
     /** [cookies] — файл сессии привязанного аккаунта (VK, OK), если есть. */
@@ -216,7 +229,7 @@ object Engine {
         }
     }
 
-    private fun fetchInfoNow(url: String, cookies: File?, processId: String): MediaInfo {
+    private fun fetchInfoNow(url: String, cookies: File?, processId: String, vkFix: Boolean = false): MediaInfo {
         val req = YoutubeDLRequest(url)
             .addOption("--no-playlist")
             .addOption("--dump-json")
@@ -224,11 +237,16 @@ object Engine {
             .addOption("--retries", 2)
             .addOption("--extractor-retries", 1)
         cookies?.let { req.addOption("--cookies", it.absolutePath) }
+        if (vkFix) pluginDir?.let { req.addOption("--plugin-dirs", it.absolutePath) }
         val response = try {
             YoutubeDL.getInstance().execute(req, processId)
         } catch (e: YoutubeDL.CanceledException) {
-            throw EngineException("Сайт слишком долго не отвечает. Проверьте интернет или включите VPN", network = true, e)
+            throw EngineException("Сайт слишком долго не отвечает. Проверьте интернет и попробуйте ещё раз", network = true, e)
         } catch (e: YoutubeDLException) {
+            if (!vkFix && needsVkFix(e.message, url)) {
+                Diag.log(TAG, "vk subtitles bug, retrying with fix")
+                return fetchInfoNow(url, cookies, processId, vkFix = true)
+            }
             throw translate(e)
         }
         return parseInfo(response.out, url, processId)
@@ -325,6 +343,7 @@ object Engine {
         cookies: File?,
         outDir: File,
         onProgress: (Progress) -> Unit,
+        vkFix: Boolean = false,
     ): File {
         outDir.mkdirs()
         // YouTube тормозит одно длинное соединение ffmpeg (~0,1 МБ/с), а кусками отдаёт в десятки раз быстрее.
@@ -375,6 +394,7 @@ object Engine {
         }
         infoJson?.let { req.addOption("--load-info-json", it.absolutePath) }
         cookies?.let { req.addOption("--cookies", it.absolutePath) }
+        if (vkFix) pluginDir?.let { req.addOption("--plugin-dirs", it.absolutePath) }
         when (option.kind) {
             FormatOption.Kind.VIDEO -> {
                 // Если формат выбран заранее — берём именно его (со звуком отдельно или без),
@@ -415,6 +435,11 @@ object Engine {
             throw e
         } catch (e: YoutubeDLException) {
             val message = e.message?.takeIf { it.isNotBlank() } ?: tail.joinToString("\n")
+            // Без сохранённого разбора yt-dlp разбирает страницу заново — и спотыкается там же, где поиск
+            if (!vkFix && needsVkFix(message, info.url)) {
+                Diag.log(TAG, "vk subtitles bug, retrying download with fix")
+                return downloadNow(taskId, info, option, section, cookies, outDir, onProgress, vkFix = true)
+            }
             throw translate(YoutubeDLException(message))
         }
         return outDir.listFiles()
@@ -607,6 +632,45 @@ object Engine {
         f.fileSizeApproximate > 0 -> f.fileSizeApproximate
         else -> f.tbr.toLong() * 1000 / 8 * durationSec
     }
+
+    /**
+     * Ошибка yt-dlp на части роликов VK: у субтитров пустое название, и разбор страницы падает
+     * (github.com/yt-dlp/yt-dlp/issues/16530). Заплатку подключаем только после такой ошибки:
+     * остальные ролики идут через обычный yt-dlp, как раньше.
+     */
+    private fun needsVkFix(message: String?, url: String): Boolean =
+        "has no attribute 'split'" in message.orEmpty() &&
+            runCatching { java.net.URI(url).host.orEmpty().lowercase() }.getOrDefault("")
+                .let { it == "vk.com" || it == "vk.ru" || it.endsWith(".vk.com") || it.endsWith(".vk.ru") || it.endsWith("vkvideo.ru") }
+
+    /**
+     * Заплатка — плагин yt-dlp: наследник разбора VK берёт ответ сайта как есть и убирает у субтитров
+     * пустое название, дальше работает обычный код yt-dlp. Если в новой версии yt-dlp ответ устроен иначе,
+     * заплатка ничего не трогает.
+     */
+    private fun writeVkFix(context: Context): File {
+        val root = File(context.filesDir, "ytdlp-plugins")
+        File(root, "kachai/yt_dlp_plugins/extractor").apply { mkdirs() }
+            .resolve("kachai_vk.py").writeText(VK_FIX)
+        return root
+    }
+
+    private val VK_FIX = """
+        |from yt_dlp.extractor.vk import VKIE
+        |
+        |
+        |class _KachaiVKIE(VKIE, plugin_name='kachai'):
+        |    def _download_payload(self, *args, **kwargs):
+        |        payload = super()._download_payload(*args, **kwargs)
+        |        try:
+        |            for params in payload[-1]['player']['params']:
+        |                for sub in params.get('subs') or []:
+        |                    if isinstance(sub, dict) and sub.get('title') is None:
+        |                        sub.pop('title', None)
+        |        except Exception:
+        |            pass
+        |        return payload
+        |""".trimMargin()
 
     /** Перевести ошибку yt-dlp в понятную человеку. */
     private fun translate(e: YoutubeDLException): EngineException {

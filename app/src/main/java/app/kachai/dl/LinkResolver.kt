@@ -25,8 +25,45 @@ object LinkResolver {
         OkHttpClient.Builder().callTimeout(10, TimeUnit.SECONDS).followRedirects(true).build()
     }
 
+    /**
+     * Убрать из ссылки метки отслеживания (utm_*, si, igsh, fbclid…): они не нужны для поиска, а длинную
+     * ссылку с ними неудобно читать. Удаляем только известные метки — резать всё после «?» нельзя:
+     * у YouTube там номер ролика (v=), у VK — номер видео (z=). Остальные параметры не трогаем,
+     * их кодировку и порядок тоже.
+     */
+    fun clean(url: String): String {
+        val q = url.indexOf('?')
+        if (q < 0) return url
+        val hash = url.indexOf('#', q).takeIf { it >= 0 } ?: url.length
+        val kept = url.substring(q + 1, hash).split('&').filter { part ->
+            val name = part.substringBefore('=').lowercase()
+            name.isNotEmpty() && name !in TRACKING && TRACKING_PREFIXES.none { name.startsWith(it) }
+        }
+        return url.substring(0, q) + (if (kept.isEmpty()) "" else "?" + kept.joinToString("&")) + url.substring(hash)
+    }
+
+    private val TRACKING = setOf(
+        "si", "pp", "feature", // YouTube «Поделиться»
+        "igsh", "igshid", // Instagram
+        "fbclid", "gclid", "yclid", "ysclid", "_openstat", "share_to", // реклама, Яндекс, Дзен
+        "_r", "_t", "is_from_webapp", "sender_device", "web_id", "share_app_id", "share_link_id", "tt_from", "u_code", // TikTok
+    )
+    private val TRACKING_PREFIXES = listOf("utm_")
+
+    /**
+     * Запись трансляции VK: vkvideo.ru/live-41593209_456254245. yt-dlp такой адрес не знает,
+     * а запись эфира — обычное видео с теми же номерами: vkvideo.ru/video-41593209_456254245.
+     */
+    private val vkLive = Regex("""^https?://(?:(?:m|www)\.)?(?:vk\.com|vk\.ru|vkvideo\.ru)/live(-?\d+_\d+)""", RegexOption.IGNORE_CASE)
+
+    private fun vkLiveToVideo(url: String): String? = vkLive.find(url)?.let { m ->
+        val query = url.substring(m.range.last + 1).takeIf { it.startsWith("?") }.orEmpty()
+        "https://vkvideo.ru/video${m.groupValues[1]}$query"
+    }
+
     suspend fun resolve(url: String): String {
         okClipToVk(url)?.let { Diag.log(TAG, "ok clip -> $it"); return it }
+        vkLiveToVideo(url)?.let { Diag.log(TAG, "vk live -> $it"); return it }
         if (!isOkClip(url)) return url
         return withContext(Dispatchers.IO) {
             runCatching {

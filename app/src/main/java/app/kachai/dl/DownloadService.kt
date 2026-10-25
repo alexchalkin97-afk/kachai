@@ -82,6 +82,7 @@ class DownloadService : Service() {
             )
             val mb = file.length() / 1048576.0
             Stats.download(task.info.site, task.option.label, true, mb, mb / seconds.coerceAtLeast(0.1))
+            app.kachai.Review.downloadDone((application as app.kachai.KachaiApp).prefs)
             finish(task, file, workDir)
         } catch (e: YoutubeDL.CanceledException) {
             Downloads.fail(task, "Отменено", cancelled = true)

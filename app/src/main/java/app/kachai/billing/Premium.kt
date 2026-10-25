@@ -28,11 +28,15 @@ import java.util.concurrent.TimeUnit
  */
 class Premium(private val prefs: Prefs, scope: CoroutineScope) {
 
+    /** Плюс бывает трёх видов: подписка RuStore, разовая покупка в RuStore и промокод. Действует самый долгий. */
+    private fun untilOf(p: androidx.datastore.preferences.core.Preferences): Long =
+        maxOf(p[Prefs.PREMIUM_UNTIL] ?: 0L, p[Prefs.PASS_UNTIL] ?: 0L, p[Prefs.PROMO_UNTIL] ?: 0L)
+
     val isPremium: StateFlow<Boolean> = prefs.data.map { p ->
-        (p[Prefs.DEBUG_PREMIUM] ?: 0) == 1 || (p[Prefs.PREMIUM_UNTIL] ?: 0L) > System.currentTimeMillis()
+        (p[Prefs.DEBUG_PREMIUM] ?: 0) == 1 || untilOf(p) > System.currentTimeMillis()
     }.stateIn(scope, SharingStarted.Eagerly, false)
 
-    val premiumUntil: StateFlow<Long> = prefs.data.map { it[Prefs.PREMIUM_UNTIL] ?: 0L }
+    val premiumUntil: StateFlow<Long> = prefs.data.map { untilOf(it) }
         .stateIn(scope, SharingStarted.Eagerly, 0L)
 
     val canActivate: Boolean get() = BuildConfig.API_BASE.isNotBlank()
@@ -48,6 +52,7 @@ class Premium(private val prefs: Prefs, scope: CoroutineScope) {
             prefs.edit { it[Prefs.DEBUG_PREMIUM] = 1 }
             return@withContext Result.success(0L)
         }
+        if (Promo.looksLikePromo(code)) return@withContext activatePromo(code)
         if (!canActivate) return@withContext Result.failure(Exception("Код не подошёл"))
         runCatching {
             val client = OkHttpClient.Builder().callTimeout(15, TimeUnit.SECONDS).build()
@@ -63,6 +68,28 @@ class Premium(private val prefs: Prefs, scope: CoroutineScope) {
             }
             resp.until
         }
+    }
+
+    /** Промокод из соцсетей: Плюс на N дней сверх уже имеющегося, один раз на телефоне. */
+    private suspend fun activatePromo(code: String): Result<Long> {
+        val promo = Promo.parse(code) ?: return Result.failure(Exception("Код не подошёл. Проверьте, что скопировали его целиком"))
+        if (LocalDate.now().isAfter(promo.validUntil)) return Result.failure(Exception("Срок действия кода закончился"))
+        var until = 0L
+        var used = false
+        prefs.edit { p ->
+            val usedIds = p[Prefs.PROMO_USED].orEmpty()
+            if (promo.id.toString() in usedIds) {
+                used = true
+                return@edit
+            }
+            val from = maxOf(System.currentTimeMillis(), p[Prefs.PROMO_UNTIL] ?: 0L)
+            until = from + promo.days * 24L * 3600_000
+            p[Prefs.PROMO_UNTIL] = until
+            p[Prefs.PROMO_USED] = usedIds + promo.id.toString()
+        }
+        if (used) return Result.failure(Exception("Этот код уже активирован на этом телефоне"))
+        app.kachai.Stats.promo(promo.id, promo.days)
+        return Result.success(until)
     }
 
     /** Только для отладочной сборки: включить премиум без оплаты. */

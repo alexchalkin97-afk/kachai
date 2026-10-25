@@ -751,7 +751,7 @@ private fun RecentDownloads(history: List<HistoryItem>, onOpenAll: () -> Unit) {
 }
 
 private val TIPS = listOf(
-    "Нажмите «Поделиться» в VK, YouTube или TikTok и выберите «Качай» — ссылка найдётся сама.",
+    "Нажмите «Поделиться» в VK, Rutube или Дзене и выберите «Качай» — ссылка найдётся сама.",
     "Для рилсов берите вертикальные ролики 9:16 в 1080p — при монтаже они не потеряют качество.",
     "Нужен только кусок длинного ролика? Нажмите «Фрагмент» и выберите начало и конец.",
     "Звук для озвучки — вкладка «Только звук»: M4A лучше по качеству, MP3 открывается везде.",
@@ -797,7 +797,7 @@ private fun SupportedSites() {
             verticalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.padding(horizontal = 4.dp),
         ) {
-            listOf("VK Видео", "Rutube", "Дзен", "Одноклассники", "YouTube", "TikTok", "+1000 сайтов").forEach {
+            listOf("VK Видео", "Rutube", "Дзен", "Одноклассники", "+1000 сайтов").forEach {
                 Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(8.dp)) {
                     Text(it, style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp))
                 }

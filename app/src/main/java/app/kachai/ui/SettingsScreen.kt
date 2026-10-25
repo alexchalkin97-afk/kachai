@@ -2,6 +2,7 @@ package app.kachai.ui
 
 import android.content.Intent
 import android.net.Uri
+import app.kachai.openStorePage
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -193,6 +194,16 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (BuildConfig.COMMUNITY_URL.isNotBlank()) {
+                    TextButton(
+                        onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(BuildConfig.COMMUNITY_URL))) },
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+                    ) { Text("Наш канал: новости и промокоды") }
+                }
+                TextButton(
+                    onClick = { openStorePage(context) },
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+                ) { Text("Оценить в RuStore") }
                 TextButton(
                     onClick = { app.kachai.Diag.share(context) },
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),

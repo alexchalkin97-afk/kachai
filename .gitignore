@@ -17,3 +17,7 @@ dist/*
 !dist/rustore/
 # HTML-кадры мокапов собирает make_mockups.py из template.html
 dist/rustore/mockups/0*.html
+
+# Промокоды: закрытый ключ и журнал выданных кодов
+promo-key.properties
+promo-codes.log

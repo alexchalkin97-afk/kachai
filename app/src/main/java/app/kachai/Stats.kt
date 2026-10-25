@@ -41,8 +41,19 @@ object Stats {
 
     fun login(site: String) = event("account_linked", "site" to site)
     fun premiumOpened() = event("premium_opened")
-    fun purchase(ok: Boolean) = event("premium_purchase", "ok" to ok)
+    fun purchase(ok: Boolean, product: String? = null) = event("premium_purchase", "ok" to ok, "product" to product)
+    /** Номер промокода — чтобы видеть, какой пост в соцсетях сработал. */
+    fun promo(id: Int, days: Int) = event("promo_activated", "code" to id, "days" to days)
     fun limitReached() = event("daily_limit_reached")
+
+    /**
+     * Обновление движка: updated / up_to_date / github_unreachable / failed.
+     * [version] — версия yt-dlp после попытки: по ней видно, как давно не обновлялись те, у кого не выходит.
+     */
+    fun engineUpdate(result: String, trigger: String, version: String?, error: String? = null) = event(
+        "engine_update",
+        "result" to result, "trigger" to trigger, "version" to version, "error" to error?.take(120),
+    )
 
     /** Группы вместо точных чисел: в отчётах AppMetrica так удобнее. */
     private fun bucket(v: Double): String = when {
