@@ -5,6 +5,11 @@ import app.kachai.BuildConfig
 import app.kachai.Diag
 import app.kachai.data.Prefs
 import kotlinx.coroutines.suspendCancellableCoroutine
+import ru.rustore.sdk.core.exception.RuStoreApplicationBannedException
+import ru.rustore.sdk.core.exception.RuStoreNotInstalledException
+import ru.rustore.sdk.core.exception.RuStoreOutdatedException
+import ru.rustore.sdk.core.exception.RuStoreUserBannedException
+import ru.rustore.sdk.core.exception.RuStoreUserUnauthorizedException
 import ru.rustore.sdk.core.tasks.Task
 import ru.rustore.sdk.pay.RuStorePayClient
 import ru.rustore.sdk.pay.model.PreferredPurchaseType
@@ -53,8 +58,11 @@ class RuStoreBilling(private val prefs: Prefs) {
         }.onFailure { Diag.log(tag, "refresh failed: ${it.message}") }.getOrDefault(false)
     }
 
-    /** Оформить подписку. Открывает платёжный экран RuStore; после оплаты сверяет статус. */
-    suspend fun purchase(): Result<Unit> {
+    /**
+     * Оформить подписку. Открывает платёжный экран RuStore; после оплаты сверяет статус.
+     * true — подписка уже активна; false — оплата прошла, но RuStore ещё не подтвердил её.
+     */
+    suspend fun purchase(): Result<Boolean> {
         if (!enabled) return Result.failure(Exception("Оплата появится в ближайшем обновлении"))
         return runCatching {
             client.getPurchaseInteractor().purchase(
@@ -64,8 +72,16 @@ class RuStoreBilling(private val prefs: Prefs) {
             ).awaitResult()
             Diag.log(tag, "purchase ok")
             refresh()
-            Unit
         }.onFailure { Diag.log(tag, "purchase failed: ${it.message}") }
+    }
+
+    /** Что сказать пользователю, если оплата не прошла. */
+    fun errorText(e: Throwable): String = when (e) {
+        is RuStoreNotInstalledException -> "Для оплаты нужно приложение RuStore — установите его"
+        is RuStoreOutdatedException -> "Обновите приложение RuStore и повторите"
+        is RuStoreUserUnauthorizedException -> "Войдите в аккаунт RuStore и повторите"
+        is RuStoreUserBannedException, is RuStoreApplicationBannedException -> "RuStore не разрешает оплату с этого аккаунта"
+        else -> "Оплата не завершена"
     }
 
     /**

@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.kachai.BuildConfig
 import app.kachai.Stats
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
@@ -86,7 +87,10 @@ fun PremiumScreen(vm: MainViewModel, onBack: () -> Unit, onMessage: (String) -> 
         Spacer(Modifier.height(28.dp))
 
         Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
-            Benefit(Icons.Rounded.HighQuality, "1080p, 2K и 4K", "В бесплатной версии — до ${BuildConfig.FREE_MAX_HEIGHT}p")
+            Benefit(
+                Icons.Rounded.HighQuality, "1080p, 2K и 4K",
+                "Если ролик загружен в таком качестве. В бесплатной версии — до ${BuildConfig.FREE_MAX_HEIGHT}p",
+            )
             Benefit(Icons.Rounded.AllInclusive, "Без лимита", "Сколько угодно видео в день. Бесплатно — ${BuildConfig.FREE_DAILY_LIMIT} в день")
             Benefit(Icons.Rounded.Block, "Без рекламы", "Совсем: ни баннеров, ни всплывающей рекламы")
             Benefit(Icons.Rounded.Favorite, "Поддержка разработки", "Подписка помогает развивать приложение")
@@ -106,8 +110,16 @@ fun PremiumScreen(vm: MainViewModel, onBack: () -> Unit, onMessage: (String) -> 
                         buying = true
                         scope.launch {
                             vm.buyPlus()
-                                .onSuccess { onMessage("Спасибо! Плюс активирован") }
-                                .onFailure { onMessage("Оплата не завершена") }
+                                .onSuccess { active ->
+                                    if (active) {
+                                        onMessage("Спасибо! Плюс активирован")
+                                    } else {
+                                        onMessage("Оплата прошла, Плюс включится через минуту")
+                                        delay(30_000)
+                                        vm.refreshPlus()
+                                    }
+                                }
+                                .onFailure { onMessage(vm.purchaseError(it)) }
                             buying = false
                         }
                     } else {

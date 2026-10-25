@@ -1,6 +1,11 @@
 package app.kachai.ui
 
 import android.app.Application
+import android.content.ClipDescription
+import android.content.ClipboardManager
+import android.content.Context
+import android.os.Build
+import android.view.textclassifier.TextClassifier
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -14,8 +19,11 @@ import app.kachai.accounts.Accounts
 import app.kachai.accounts.Site
 import app.kachai.data.Prefs
 import app.kachai.data.ThemeMode
+import app.kachai.dl.ClipSection
 import app.kachai.dl.Downloads
 import app.kachai.dl.Engine
+import app.kachai.dl.Extras
+import app.kachai.dl.Subtitle
 import app.kachai.dl.EngineException
 import app.kachai.dl.FormatOption
 import app.kachai.dl.LinkResolver
@@ -36,6 +44,9 @@ sealed interface Lookup {
     data class Failed(val message: String, val loginSite: Site? = null, val reloginSite: Site? = null) : Lookup
 }
 
+/** Подсказка «в буфере обмена ссылка»: [stamp] — время копирования, [host] — сайт, если текст прочитан. */
+data class ClipboardHint(val stamp: Long, val host: String?)
+
 /** Результат нажатия «Скачать». */
 enum class StartResult { STARTED, STARTED_SHOW_AD, LIMIT_REACHED, NEEDS_PREMIUM }
 
@@ -46,13 +57,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var lookup by mutableStateOf<Lookup>(Lookup.Idle)
         private set
     var selected by mutableStateOf<FormatOption?>(null)
+    /** Качать только фрагмент; null — ролик целиком. */
+    var section by mutableStateOf<ClipSection?>(null)
+    /** Сохраняется обложка или субтитры — кнопки на время блокируем. */
+    var savingExtra by mutableStateOf(false)
+        private set
+    /** В буфере обмена ссылка, которую ещё не предлагали; host — сайт, если его удалось прочитать. */
+    var clipboardHint by mutableStateOf<ClipboardHint?>(null)
+        private set
+
+    /** Короткие сообщения внизу экрана. */
+    val messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
 
     val tasks = Downloads.tasks
     val history = Downloads.history
     val isPremium = k.premium.isPremium
     val premiumUntil = k.premium.premiumUntil
     val quota = k.quota.state
-    val themeMode = k.prefs.themeMode.stateIn(viewModelScope, SharingStarted.Eagerly, ThemeMode.SYSTEM)
+    val themeMode = k.prefs.themeMode.stateIn(viewModelScope, SharingStarted.Eagerly, ThemeMode.DARK)
     val audioByDefault = k.prefs.audioByDefault.stateIn(viewModelScope, SharingStarted.Eagerly, false)
     val videoHeight = k.prefs.videoHeight.stateIn(viewModelScope, SharingStarted.Eagerly, 1080)
     val audioMp3 = k.prefs.audioMp3.stateIn(viewModelScope, SharingStarted.Eagerly, false)
@@ -78,6 +100,64 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         input = ""
         lookup = Lookup.Idle
         selected = null
+        section = null
+    }
+
+    /** Время метки последнего предложенного из буфера текста — чтобы не предлагать одно и то же. */
+    private var offeredClipAt = -1L
+
+    /**
+     * Проверить буфер обмена, когда окно получило фокус (раньше Android его не отдаёт).
+     * На Android 12+ чтение буфера показывает системное «Вставлено из…», поэтому там текст не читаем,
+     * а смотрим, распознала ли система в нём ссылку. Сам текст читаем, только когда человек нажмёт «Найти».
+     */
+    fun checkClipboard(context: Context) {
+        if (input.isNotBlank() || lookup !is Lookup.Idle) return
+        val cm = context.getSystemService(ClipboardManager::class.java) ?: return
+        val desc = cm.primaryClipDescription ?: return
+        val stamp = desc.timestamp
+        if (stamp == offeredClipAt || !desc.hasMimeType("text/*")) return
+        clipboardHint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val isUrl = desc.classificationStatus == ClipDescription.CLASSIFICATION_COMPLETE &&
+                desc.getConfidenceScore(TextClassifier.TYPE_URL) >= 0.5f
+            if (!isUrl) return
+            ClipboardHint(stamp, host = null)
+        } else {
+            val text = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+            val url = text?.let(::extractUrl) ?: return
+            ClipboardHint(stamp, host = siteOf(url))
+        }
+    }
+
+    fun useClipboard(context: Context) {
+        val hint = clipboardHint ?: return
+        offeredClipAt = hint.stamp
+        clipboardHint = null
+        val cm = context.getSystemService(ClipboardManager::class.java) ?: return
+        val text = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
+        val url = text?.let(::extractUrl) ?: return
+        input = url
+        find()
+    }
+
+    fun dismissClipboard() {
+        clipboardHint?.let { offeredClipAt = it.stamp }
+        clipboardHint = null
+    }
+
+    /** Обложка текущего ролика — в «Загрузки», без лимита. */
+    fun saveCover() = saveExtra { info -> Extras.saveCover(k, info); "Обложка сохранена в «Загрузки/Качай»" }
+
+    fun saveSubtitles(sub: Subtitle) = saveExtra { info -> Extras.saveSubtitles(k, info, sub); "Субтитры (${sub.lang}) сохранены в «Загрузки/Качай»" }
+
+    private fun saveExtra(block: suspend (MediaInfo) -> String) {
+        val info = (lookup as? Lookup.Ready)?.info ?: return
+        savingExtra = true
+        viewModelScope.launch {
+            val text = runCatching { block(info) }.getOrElse { "Не получилось: ${it.message}" }
+            savingExtra = false
+            messages.tryEmit(text)
+        }
     }
 
     fun find() {
@@ -89,6 +169,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         lookupJob?.cancel()
         lookup = Lookup.Loading
         selected = null
+        section = null
+        clipboardHint = null
         lookupJob = viewModelScope.launch {
             // Клипы OK превращаем в ссылку VK (см. LinkResolver)
             val url = LinkResolver.resolve(raw)
@@ -154,7 +236,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             Stats.limitReached()
             return StartResult.LIMIT_REACHED
         }
-        Downloads.enqueue(k, ready.info, option)
+        Downloads.enqueue(k, ready.info, option, section?.takeIf { it.lengthSec > 0 })
         viewModelScope.launch { k.quota.consume() }
         clear()
         if (isPremium.value) return StartResult.STARTED
@@ -173,6 +255,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { downloadsSinceAd = k.prefs.data.first()[Prefs.DOWNLOADS_SINCE_AD] ?: 0 }
     }
 
+    /**
+     * Повторить неудавшуюся загрузку. Неудача вернула попытку в лимит, поэтому повтор — новая загрузка:
+     * проверяем лимит и снова списываем. false — лимит исчерпан.
+     */
+    fun retry(id: String): Boolean {
+        if (!k.quota.canDownload()) {
+            Stats.limitReached()
+            return false
+        }
+        Downloads.retry(k, id)
+        viewModelScope.launch { k.quota.consume() }
+        return true
+    }
+
     fun addReward() = viewModelScope.launch { k.quota.addReward() }
 
     fun setThemeMode(m: ThemeMode) = viewModelScope.launch { k.prefs.setThemeMode(m) }
@@ -189,7 +285,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Оплата через RuStore доступна в этой сборке. */
     val canBuyInApp get() = k.rustore.enabled
 
-    suspend fun buyPlus(): Result<Unit> = k.rustore.purchase().also { Stats.purchase(it.isSuccess) }
+    suspend fun buyPlus(): Result<Boolean> = k.rustore.purchase().also { Stats.purchase(it.isSuccess) }
+
+    fun purchaseError(e: Throwable): String = k.rustore.errorText(e)
+
+    /** Сверить подписку с RuStore ещё раз: после оплаты подтверждение иногда приходит не сразу. */
+    fun refreshPlus() = viewModelScope.launch { k.rustore.refresh() }
 
     var engineVersion by mutableStateOf<String?>(null)
         private set

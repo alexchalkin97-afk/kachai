@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Окно до старта Compose: без мигания белым в тёмной теме -->
-    <style name="Theme.Kachai" parent="android:Theme.Material.Light.NoActionBar">
+    <!-- Окно до старта Compose. Тёмное всегда: тёмная тема — по умолчанию, так нет вспышки белым -->
+    <style name="Theme.Kachai" parent="android:Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/bg</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>

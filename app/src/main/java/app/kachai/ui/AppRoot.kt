@@ -20,8 +20,12 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -79,10 +83,31 @@ fun AppRoot(vm: MainViewModel) {
     }
     LaunchedEffect(Unit) { vm.openDownloads.collect { go(Tab.DOWNLOADS.route) } }
     LaunchedEffect(Unit) { vm.openHome.collect { go(Tab.HOME.route) } }
+    LaunchedEffect(Unit) { vm.messages.collect { message(it) } }
+
+    // Готово — лёгкая вибрация и плашка «Открыть», пока приложение на экране
+    val haptic = LocalHapticFeedback.current
+    LaunchedEffect(Unit) {
+        var lastTop = vm.history.value.firstOrNull()?.id
+        vm.history.collect { list ->
+            val top = list.firstOrNull() ?: return@collect
+            if (top.id == lastTop) return@collect
+            val isNew = lastTop != null || list.size == 1
+            lastTop = top.id
+            if (!isNew || System.currentTimeMillis() - top.createdAt > 10_000) return@collect
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            launch {
+                val result = snackbar.showSnackbar(
+                    "Скачано: ${top.title.take(40)}", actionLabel = "Открыть", duration = SnackbarDuration.Short,
+                )
+                if (result == SnackbarResult.ActionPerformed) openFile(context, top)
+            }
+        }
+    }
 
     fun start() {
         when (vm.startDownload()) {
-            StartResult.LIMIT_REACHED -> message("Лимит на сегодня исчерпан")
+            StartResult.LIMIT_REACHED -> message(LIMIT_REACHED)
             StartResult.NEEDS_PREMIUM -> nav.navigate(PREMIUM)
             StartResult.STARTED_SHOW_AD -> { Ads.showInterstitial(activity); message("Загрузка началась") }
             StartResult.STARTED -> message("Загрузка началась")
@@ -147,6 +172,7 @@ fun AppRoot(vm: MainViewModel) {
             composable(Tab.HOME.route) {
                 HomeScreen(
                     vm, onDownload = ::onDownload, onOpenPremium = { nav.navigate(PREMIUM) },
+                    onOpenDownloads = { go(Tab.DOWNLOADS.route) },
                     onLogin = { login.launch(it) },
                 )
             }

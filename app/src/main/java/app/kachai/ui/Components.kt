@@ -1,5 +1,10 @@
 package app.kachai.ui
 
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,6 +36,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.kachai.dl.HistoryItem
 import app.kachai.dl.Task
 import app.kachai.dl.TaskState
 import app.kachai.ui.theme.MonoNumbers
@@ -42,7 +48,9 @@ import java.util.Locale
 fun formatBytes(bytes: Long): String = when {
     bytes <= 0 -> ""
     bytes < 1024L * 1024 -> "${(bytes / 1024).coerceAtLeast(1)} КБ"
-    bytes < 1024L * 1024 * 1024 -> "${bytes / (1024 * 1024)} МБ"
+    // До 10 МБ — с десятыми (1,9 МБ, а не «1 МБ»), дальше — округляем до целого
+    bytes < 10L * 1024 * 1024 -> String.format(Locale("ru"), "%.1f МБ", bytes / (1024.0 * 1024))
+    bytes < 1024L * 1024 * 1024 -> "${(bytes + 512 * 1024) / (1024 * 1024)} МБ"
     else -> String.format(Locale("ru"), "%.1f ГБ", bytes / (1024.0 * 1024 * 1024))
 }
 
@@ -78,6 +86,79 @@ fun formatDay(ts: Long): String {
     }
 }
 
+/** Открыть скачанный файл в подходящем приложении (плеер, галерея). */
+fun openFile(context: Context, item: HistoryItem) {
+    val intent = Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(item.fileUri), item.mime)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    try {
+        context.startActivity(intent)
+    } catch (e: ActivityNotFoundException) {
+        Toast.makeText(context, "Нет приложения, чтобы открыть файл", Toast.LENGTH_SHORT).show()
+    } catch (e: SecurityException) {
+        Toast.makeText(context, "Файл удалён или перемещён", Toast.LENGTH_SHORT).show()
+    }
+}
+
+/** Отправить файл в редактор или мессенджер — главный сценарий после загрузки. */
+fun shareFile(context: Context, item: HistoryItem) {
+    val send = Intent(Intent.ACTION_SEND)
+        .setType(item.mime)
+        .putExtra(Intent.EXTRA_STREAM, Uri.parse(item.fileUri))
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    context.startActivity(Intent.createChooser(send, null))
+}
+
+/** 1 234 → «1,2 тыс.», 3 400 000 → «3,4 млн». */
+fun formatCount(n: Long): String = when {
+    n <= 0 -> ""
+    n < 1_000 -> "$n"
+    n < 1_000_000 -> String.format(Locale("ru"), if (n < 10_000) "%.1f тыс." else "%.0f тыс.", n / 1_000.0)
+    n < 1_000_000_000 -> String.format(Locale("ru"), if (n < 10_000_000) "%.1f млн" else "%.0f млн", n / 1_000_000.0)
+    else -> String.format(Locale("ru"), "%.1f млрд", n / 1_000_000_000.0)
+}
+
+/** «20261021» → «3 дня назад» / «2 мес. назад» / «2019». */
+fun formatAge(yyyyMMdd: String?): String {
+    val date = yyyyMMdd?.let { runCatching { java.time.LocalDate.parse(it, java.time.format.DateTimeFormatter.BASIC_ISO_DATE) }.getOrNull() }
+        ?: return ""
+    val days = java.time.temporal.ChronoUnit.DAYS.between(date, java.time.LocalDate.now())
+    return when {
+        days < 0 -> ""
+        days == 0L -> "сегодня"
+        days == 1L -> "вчера"
+        days < 7 -> "$days ${plural(days, "день", "дня", "дней")} назад"
+        days < 31 -> "${days / 7} нед. назад"
+        days < 365 -> "${days / 30} мес. назад"
+        else -> "${date.year}"
+    }
+}
+
+fun plural(n: Long, one: String, few: String, many: String): String {
+    val m10 = n % 10
+    val m100 = n % 100
+    return when {
+        m10 == 1L && m100 != 11L -> one
+        m10 in 2..4 && m100 !in 12..14 -> few
+        else -> many
+    }
+}
+
+/** Ориентация кадра для рилсмейкеров: «9:16» и т.п.; null — размер неизвестен. */
+fun aspectLabel(width: Int, height: Int): String? {
+    if (width <= 0 || height <= 0) return null
+    val r = width.toDouble() / height
+    return when {
+        r < 0.65 -> "9:16"
+        r < 0.9 -> "3:4"
+        r < 1.12 -> "1:1"
+        r < 1.5 -> "4:3"
+        r < 2.0 -> "16:9"
+        else -> "21:9"
+    }
+}
+
+fun isVertical(width: Int, height: Int) = width > 0 && height > width * 1.1
+
 /** Небольшая «таблетка»: лимит, статус Плюса. */
 @Composable
 fun Pill(
@@ -102,11 +183,17 @@ fun Pill(
 
 /** Карточка активной загрузки: прогресс, отмена, ошибка с повтором. */
 @Composable
-fun TaskCard(task: Task, onCancel: () -> Unit, onRetry: () -> Unit, onDismiss: () -> Unit) {
+fun TaskCard(
+    task: Task,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerLow,
         shape = MaterialTheme.shapes.medium,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(start = 16.dp, top = 12.dp, bottom = 14.dp, end = 4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -162,6 +249,7 @@ private fun statusLine(t: Task): String = when (t.state) {
         formatSpeed(t.speedBps).takeIf { it.isNotEmpty() }?.let { append(" · $it") }
         formatEta(t.etaSec).takeIf { it.isNotEmpty() && t.progress >= 0 }?.let { append(" · ещё $it") }
         append(" · ${t.option.label}")
+        t.section?.let { append(" · ${it.label}") }
     }
     TaskState.PROCESSING ->
         if (t.option.kind == app.kachai.dl.FormatOption.Kind.VIDEO) "Склеиваем видео и звук…" else "Готовим аудиофайл…"
@@ -180,6 +268,8 @@ fun SectionTitle(text: String, modifier: Modifier = Modifier) {
 }
 
 val ScreenPadding = Arrangement.spacedBy(12.dp)
+
+const val LIMIT_REACHED = "Лимит на сегодня исчерпан"
 
 /** Напоминание об авторских правах: на главном экране и в «О приложении». */
 const val RIGHTS_NOTICE = "Используйте только видео, на которые у вас есть права, или в рамках допустимого цитирования."

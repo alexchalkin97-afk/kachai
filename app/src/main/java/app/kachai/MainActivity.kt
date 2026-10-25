@@ -35,6 +35,12 @@ class MainActivity : ComponentActivity() {
         handle(intent)
     }
 
+    /** Буфер обмена Android отдаёт только окну в фокусе — поэтому проверяем здесь, а не при старте. */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) vm.checkClipboard(this)
+    }
+
     private fun handle(intent: Intent?) {
         intent ?: return
         when {

@@ -25,6 +25,8 @@ object Storage {
         "m4a" -> "audio/mp4"
         "mp3" -> "audio/mpeg"
         "opus", "ogg" -> "audio/ogg"
+        "jpg", "jpeg" -> "image/jpeg"
+        "srt" -> "application/x-subrip"
         else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension) ?: "application/octet-stream"
     }
 

@@ -107,7 +107,7 @@ class DownloadService : Service() {
         return coroutineScope {
             val poller = launch { pollDiskProgress(task, workDir, enginePercent) }
             try {
-                Engine.download(task.id, task.info, task.option, cookies, workDir) { p ->
+                Engine.download(task.id, task.info, task.option, task.section, cookies, workDir) { p ->
                     if (!p.processing && p.percent >= 0) enginePercent.set(p.percent)
                     Downloads.update(task.id) {
                         it.copy(
@@ -116,7 +116,9 @@ class DownloadService : Service() {
                             // иначе его считает pollDiskProgress (aria2c свой прогресс не выводит)
                             progress = when {
                                 p.processing -> -1f
-                                task.option.approxBytes <= 0 && p.percent >= 0 -> p.percent
+                                // У фрагмента процент yt-dlp идёт по каждой дорожке отдельно (видео 0→100, звук
+                                // снова 0→100) — полоса прыгала бы. Для него только байты на диске
+                                task.option.approxBytes <= 0 && task.section == null && p.percent >= 0 -> p.percent
                                 else -> it.progress
                             },
                         )
@@ -133,7 +135,11 @@ class DownloadService : Service() {
      * поэтому длина файла обманчива — считаем занятые блоки (st_blocks), это и есть скачанное.
      */
     private suspend fun pollDiskProgress(task: Task, workDir: File, enginePercent: AtomicReference<Float>) {
-        val total = task.option.approxBytes
+        // У фрагмента и размер — доля от всего ролика. Если он вырезается из скачанного целиком (YouTube) —
+        // качается весь ролик, и считаем от полного размера
+        val total = task.section?.takeUnless { Engine.cutsLocally(task.info) }?.let { s ->
+            if (task.info.durationSec > 0) task.option.approxBytes * s.lengthSec / task.info.durationSec else 0L
+        } ?: task.option.approxBytes
         var lastBytes = 0L
         var lastAt = SystemClock.elapsedRealtime()
         var speed = 0.0
@@ -157,8 +163,8 @@ class DownloadService : Service() {
                         bytes <= total -> (bytes * 100f / total).coerceAtMost(99f)
                         // Скачано больше оценки: она бывает занижена (размер посчитан по битрейту, или звук
                         // вырезается из целого видео). Тогда верим проценту yt-dlp, а без него (-1)
-                        // вместо процента показываем, сколько скачано
-                        else -> enginePercent.get()
+                        // вместо процента показываем, сколько скачано. У фрагмента — сразу второе
+                        else -> if (task.section != null) -1f else enginePercent.get()
                     },
                     etaSec = if (total > bytes && speed > 1) ((total - bytes) / speed).toLong() else 0,
                 )
@@ -193,7 +199,10 @@ class DownloadService : Service() {
             sizeBytes = file.length(),
             thumbPath = thumb,
             createdAt = System.currentTimeMillis(),
-            label = task.option.label,
+            label = task.option.label + task.section?.let { " · ${it.label}" }.orEmpty(),
+            durationSec = task.section?.lengthSec ?: task.info.durationSec,
+            width = task.option.frameWidth.takeIf { it > 0 } ?: task.info.width,
+            height = task.option.frameHeight.takeIf { it > 0 } ?: task.info.height,
         )
         Downloads.complete(task, item)
         notifyDone(item)

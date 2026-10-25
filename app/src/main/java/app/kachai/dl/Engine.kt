@@ -21,6 +21,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Что нашли по ссылке. */
@@ -39,7 +42,23 @@ data class MediaInfo(
      * заново — это лишние секунды «подготовки».
      */
     val infoJsonPath: String? = null,
+    /** Кадр лучшего видео: по нему видно ориентацию (вертикальное — для рилсов). 0 — неизвестно. */
+    val width: Int = 0,
+    val height: Int = 0,
+    val fps: Int = 0,
+    val viewCount: Long = 0,
+    val likeCount: Long = 0,
+    /** Дата публикации в виде yyyyMMdd, как отдаёт yt-dlp. */
+    val uploadDate: String? = null,
+    /** Субтитры от автора (не автоматические). */
+    val subtitles: List<Subtitle> = emptyList(),
+    /** Обложки от лучшей к худшей (thumbnail — обычно средняя, для превью). Крупной на сайте может не оказаться. */
+    val coverUrls: List<String> = emptyList(),
 )
+
+/** Файл субтитров на сайте: язык и прямая ссылка. */
+@Serializable
+data class Subtitle(val lang: String, val name: String, val url: String, val ext: String)
 
 /** Вариант загрузки, который видит пользователь. */
 @Serializable
@@ -50,6 +69,11 @@ data class FormatOption(
     val approxBytes: Long = 0,
     /** Конкретный видеоформат yt-dlp: так разрешение не окажется выше выбранного. */
     val formatId: String? = null,
+    /** Точный кадр, частота и кодек выбранного формата — для подсказки под вариантами. */
+    val frameWidth: Int = 0,
+    val frameHeight: Int = 0,
+    val fps: Int = 0,
+    val codec: String? = null,
 ) {
     enum class Kind { VIDEO, AUDIO_M4A, AUDIO_MP3 }
 
@@ -99,9 +123,11 @@ object Engine {
     private val heightsLadder = listOf(2160, 1440, 1080, 720, 480, 360)
 
     private lateinit var infoDir: File
+    private lateinit var appContext: Context
 
     /** Распаковка Python занимает несколько секунд при первом запуске — делаем это в фоне. */
     fun init(context: Context) {
+        appContext = context.applicationContext
         infoDir = File(context.cacheDir, "info").apply { mkdirs() }
         try {
             YoutubeDL.getInstance().init(context)
@@ -223,16 +249,29 @@ object Engine {
         val info = runCatching { YoutubeDL.objectMapper.readValue(json, VideoInfo::class.java) }
             .getOrElse { throw EngineException("Не получилось разобрать ответ сайта", network = false, it) }
         val infoFile = runCatching { File(infoDir, "$fileId.json").apply { writeText(json) } }.getOrNull()
+        val video = info.formats.orEmpty().filter { it.height > 0 && it.vcodec != null && it.vcodec != "none" }
+        val best = video.maxWithOrNull(compareBy({ minOf(it.width, it.height).takeIf { w -> w > 0 } ?: it.height }, { it.tbr }))
+        // Instagram и некоторые другие сайты длительность не сообщают — без неё нет ни фрагмента, ни оценки
+        // размера. Тогда спрашиваем ffmpeg: он читает её из заголовка видео, не скачивая файл
+        val duration = info.duration.takeIf { it > 0 } ?: best?.let(::probeDuration) ?: 0
         return MediaInfo(
+            width = best?.width?.takeIf { it > 0 } ?: info.width,
+            height = best?.height?.takeIf { it > 0 } ?: info.height,
+            fps = best?.fps ?: 0,
+            viewCount = info.viewCount?.toLongOrNull() ?: 0,
+            likeCount = info.likeCount?.toLongOrNull() ?: 0,
+            uploadDate = info.uploadDate?.takeIf { it.length == 8 },
+            subtitles = runCatching { parseSubtitles(json) }.getOrDefault(emptyList()),
+            coverUrls = runCatching { coverCandidates(json) }.getOrDefault(emptyList()),
             infoJsonPath = infoFile?.absolutePath,
             url = info.webpageUrl ?: url,
             id = info.id ?: url.hashCode().toString(),
             title = info.title ?: info.fulltitle ?: "Без названия",
             uploader = info.uploader,
-            durationSec = info.duration,
+            durationSec = duration,
             thumbnail = info.thumbnail,
             site = info.extractorKey ?: info.extractor ?: "",
-            options = buildOptions(info.formats.orEmpty(), info.duration),
+            options = buildOptions(info.formats.orEmpty(), duration),
         )
     }
 
@@ -247,24 +286,34 @@ object Engine {
         taskId: String,
         info: MediaInfo,
         option: FormatOption,
+        section: ClipSection?,
         cookies: File?,
         outDir: File,
         onProgress: (Progress) -> Unit,
     ): File = withContext(Dispatchers.IO) {
-        useEngine { downloadNow(taskId, info, option, cookies, outDir, onProgress) }
+        useEngine { downloadNow(taskId, info, option, section, cookies, outDir, onProgress) }
     }
 
     private fun downloadNow(
         taskId: String,
         info: MediaInfo,
         option: FormatOption,
+        section: ClipSection?,
         cookies: File?,
         outDir: File,
         onProgress: (Progress) -> Unit,
     ): File {
         outDir.mkdirs()
+        // YouTube тормозит одно длинное соединение ffmpeg (~0,1 МБ/с), а кусками отдаёт в десятки раз быстрее.
+        // Поэтому его фрагмент качаем целиком и вырезаем отрезок уже на телефоне (см. cutsLocally)
+        if (section != null && cutsLocally(info)) {
+            val whole = downloadNow(taskId, info, option, null, cookies, outDir, onProgress)
+            onProgress(Progress(-1f, 0, -1, processing = true))
+            return cutWithFfmpeg(taskId, whole, section)
+        }
         val savedInfo = info.infoJsonPath?.let(::File)?.takeIf { it.exists() }
-        val infoJson = savedInfo?.let { runCatching { chunkYoutube(it) }.getOrNull() ?: it }
+        // Фрагмент по сети вырезает ffmpeg прямо из потока — ему нужны исходные ссылки, без нарезки на куски
+        val infoJson = if (section != null) savedInfo else savedInfo?.let { runCatching { chunkYoutube(it) }.getOrNull() ?: it }
         val chunked = infoJson != null && infoJson != savedInfo
         if (chunked) Diag.log(TAG, "youtube: ${YT_CHUNK shr 20} MB chunks x$YT_PARALLEL")
         // С --load-info-json ссылку не передаём: иначе yt-dlp разберёт страницу ещё раз
@@ -287,22 +336,28 @@ object Engine {
         // Обычные файлы качает aria2c: 8 потоков по 1 МБ, «замёрзший» поток (<50 КБ/с) рвёт
         // и переоткрывает. Под ТСПУ одно соединение то и дело подвисает — так скорость не падает до нуля.
         // HLS-плейлисты и нарезанный YouTube (см. chunkYoutube) — встроенному загрузчику.
-        req.addOption("--downloader", "libaria2c.so")
-            .addOption("--downloader", "m3u8:native")
-            .addOption("--downloader", "dash:native")
-            .addOption(
-                "--downloader-args",
-                "aria2c:-x 8 -s 8 -k 1M --lowest-speed-limit=50K --max-tries=0 --retry-wait=1 " +
-                    "--timeout=15 --connect-timeout=10 --file-allocation=none --summary-interval=1",
-            )
+        // Фрагмент качает ffmpeg: он сам переходит к нужному месту и берёт только этот кусок
+        if (section == null) {
+            req.addOption("--downloader", "libaria2c.so")
+                .addOption("--downloader", "m3u8:native")
+                .addOption("--downloader", "dash:native")
+                .addOption(
+                    "--downloader-args",
+                    "aria2c:-x 8 -s 8 -k 1M --lowest-speed-limit=50K --max-tries=0 --retry-wait=1 " +
+                        "--timeout=15 --connect-timeout=10 --file-allocation=none --summary-interval=1",
+                )
+        } else {
+            req.addOption("--download-sections", "*${section.startSec}-${section.endSec}")
+            Diag.log(TAG, "section ${section.label}")
+        }
         infoJson?.let { req.addOption("--load-info-json", it.absolutePath) }
         cookies?.let { req.addOption("--cookies", it.absolutePath) }
         when (option.kind) {
             FormatOption.Kind.VIDEO -> {
                 // Если формат выбран заранее — берём именно его (со звуком отдельно или без),
                 // иначе — сортировка: сначала высота, потом H.264 и mp4, их играют даже старые телефоны
-                // Запасное «bv*+ba/b» — если поиск был на сервере, а разбор заново на телефоне:
-                // там другие клиенты YouTube и такого номера формата может не быть, тогда решает -S
+                // Запасное «bv*+ba/b» — если страница разобрана заново и такого номера формата уже нет:
+                // тогда решает -S
                 option.formatId?.let { id -> req.addOption("-f", "$id+ba/$id/bv*+ba/b") }
                 val res = option.height?.let { "res:$it," }.orEmpty()
                 req.addOption("-S", "${res}vcodec:h264,ext:mp4:m4a")
@@ -345,6 +400,83 @@ object Engine {
             ?: throw EngineException("Файл не найден после загрузки", network = false)
     }
 
+    /**
+     * Фрагмент вырезаем из скачанного целиком ролика, а не тянем по сети через ffmpeg: так у YouTube
+     * (его файлы режутся на куски, см. chunkYoutube). У остальных сайтов видео и так идёт короткими
+     * сегментами HLS, и ffmpeg качает отрезок быстро.
+     */
+    fun cutsLocally(info: MediaInfo): Boolean =
+        info.site.equals("Youtube", ignoreCase = true) && info.infoJsonPath?.let { File(it).exists() } == true
+
+    /**
+     * Встроенный ffmpeg — тот же, что вызывает yt-dlp, с теми же библиотеками
+     * (LD_LIBRARY_PATH как у youtubedl-android).
+     */
+    private fun ffmpeg(vararg args: String): ProcessBuilder {
+        val bin = File(appContext.applicationInfo.nativeLibraryDir, "libffmpeg.so")
+        val packages = File(appContext.noBackupFilesDir, "youtubedl-android/packages")
+        return ProcessBuilder(listOf(bin.absolutePath) + args).redirectErrorStream(true).apply {
+            environment()["LD_LIBRARY_PATH"] =
+                listOf("python", "ffmpeg", "aria2c").joinToString(":") { File(packages, "$it/usr/lib").absolutePath }
+        }
+    }
+
+    /** Длительность видео по ссылке: ffmpeg читает только заголовок файла. null — не вышло за 15 с. */
+    private fun probeDuration(format: VideoFormat): Int? = runCatching {
+        val url = format.url?.takeIf { it.startsWith("http") } ?: return null
+        val headers = format.httpHeaders.orEmpty().entries.joinToString("") { "${it.key}: ${it.value}\r\n" }
+        val args = buildList {
+            add("-hide_banner")
+            if (headers.isNotEmpty()) { add("-headers"); add(headers) }
+            add("-i"); add(url)
+        }
+        val process = ffmpeg(*args.toTypedArray()).start()
+        // Вывод «ffmpeg -i» короткий и не забьёт канал, поэтому можно сначала дождаться конца
+        if (!process.waitFor(15, TimeUnit.SECONDS)) {
+            process.destroy()
+            return null
+        }
+        val out = process.inputStream.bufferedReader().readText()
+        Regex("""Duration: (\d+):(\d{2}):(\d{2}(?:\.\d+)?)""").find(out)?.destructured?.let { (h, m, s) ->
+            (h.toInt() * 3600 + m.toInt() * 60 + s.toDouble()).roundToInt()
+        }?.takeIf { it > 0 }?.also { Diag.log(TAG, "duration from ffmpeg: ${it}s") }
+    }.getOrNull()
+
+    /** Идущие нарезки — чтобы «Отменить» останавливал и их, а не только yt-dlp. */
+    private val cutProcesses = ConcurrentHashMap<String, Process>()
+    private val cancelledCuts = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Вырезать отрезок из готового файла встроенным ffmpeg — тем же, что вызывает yt-dlp, с теми же
+     * библиотеками (LD_LIBRARY_PATH как у youtubedl-android). Без перекодирования, поэтому за секунды;
+     * начало прилипает к ближайшему ключевому кадру.
+     */
+    private fun cutWithFfmpeg(taskId: String, source: File, section: ClipSection): File {
+        val target = File(source.parentFile, "cut.${source.extension}")
+        Diag.log(TAG, "cutting ${section.label} from ${source.length() / 1024} KB")
+        val process = ffmpeg(
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", section.startSec.toString(), "-i", source.absolutePath, "-t", section.lengthSec.toString(),
+            "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero",
+            target.absolutePath,
+        ).start()
+        cutProcesses[taskId] = process
+        val output = try {
+            process.inputStream.bufferedReader().readText().also { process.waitFor() }
+        } finally {
+            cutProcesses.remove(taskId)
+        }
+        if (cancelledCuts.remove(taskId)) throw YoutubeDL.CanceledException()
+        if (process.exitValue() != 0 || !target.exists() || target.length() == 0L) {
+            Diag.log(TAG, "ffmpeg cut failed (${process.exitValue()}): ${output.takeLast(500)}")
+            throw EngineException("Не получилось вырезать фрагмент", network = false)
+        }
+        // Итоговый файл — под именем ролика, а не «cut»
+        source.delete()
+        return File(source.parentFile, source.name).also { target.renameTo(it) }
+    }
+
+
     // aria2c: «DL:2.1MiB», yt-dlp: «at 2.10MiB/s»
     private val speedRegex = Regex("""(?:DL:|\sat\s+)([\d.]+)([KMG]i)?B""")
 
@@ -357,6 +489,7 @@ object Engine {
 
     fun cancel(taskId: String) {
         YoutubeDL.getInstance().destroyProcessById(taskId)
+        cutProcesses[taskId]?.let { cancelledCuts += taskId; it.destroy() }
     }
 
     private fun buildOptions(formats: List<VideoFormat>, durationSec: Int): List<FormatOption> {
@@ -383,7 +516,11 @@ object Engine {
                 )
                 val hasAudio = pick?.acodec != null && pick.acodec != "none"
                 val bytes = pick?.let { sizeOf(it, durationSec) + if (hasAudio) 0 else audioBytes } ?: 0
-                FormatOption(FormatOption.Kind.VIDEO, h, bytes, pick?.formatId)
+                FormatOption(
+                    FormatOption.Kind.VIDEO, h, bytes, pick?.formatId,
+                    frameWidth = pick?.width ?: 0, frameHeight = pick?.height ?: 0,
+                    fps = pick?.fps ?: 0, codec = pick?.vcodec?.let(::codecName),
+                )
             }
         }
         val audioOptions = if (audio.isNotEmpty() || maxHeight > 0) listOf(
@@ -392,6 +529,46 @@ object Engine {
             FormatOption(FormatOption.Kind.AUDIO_MP3, approxBytes = 190_000L / 8 * durationSec),
         ) else emptyList()
         return videoOptions + audioOptions
+    }
+
+    /** Понятное имя кодека: H.264 открывается в любом редакторе, VP9/AV1 — не везде. */
+    private fun codecName(vcodec: String): String? = when {
+        vcodec.startsWith("avc") || vcodec.startsWith("h264") -> "H.264"
+        vcodec.startsWith("hev") || vcodec.startsWith("hvc") || vcodec.startsWith("h265") -> "H.265"
+        vcodec.startsWith("vp9") || vcodec.startsWith("vp09") -> "VP9"
+        vcodec.startsWith("av01") || vcodec.startsWith("av1") -> "AV1"
+        else -> null
+    }
+
+    /**
+     * Обложки от лучшей к худшей. yt-dlp перечисляет их от худшей к лучшей, а размер указывает не у всех
+     * (у YouTube у maxresdefault его нет) — поэтому идём с конца списка. JPEG вперёд WebP той же картинки.
+     */
+    private fun coverCandidates(json: String): List<String> =
+        YoutubeDL.objectMapper.readTree(json).path("thumbnails").toList()
+            .map { it.path("url").asText() }
+            .filter { it.startsWith("http") }
+            .reversed()
+            .let { all -> all.filterNot { ".webp" in it }.take(4) + all.filter { ".webp" in it }.take(1) }
+
+    /**
+     * Субтитры от автора из ответа yt-dlp («subtitles», не «automatic_captions»): по одному файлу
+     * на язык, в формате, который умеем сохранить как .srt (srt или vtt).
+     */
+    private fun parseSubtitles(json: String): List<Subtitle> {
+        val subs = YoutubeDL.objectMapper.readTree(json).path("subtitles")
+        val result = mutableListOf<Subtitle>()
+        subs.fieldNames().forEach { lang ->
+            if (lang == "live_chat") return@forEach
+            val files = subs.path(lang).toList()
+            val file = files.firstOrNull { it.path("ext").asText() == "srt" }
+                ?: files.firstOrNull { it.path("ext").asText() == "vtt" }
+                ?: return@forEach
+            val url = file.path("url").asText().takeIf { it.startsWith("http") } ?: return@forEach
+            result += Subtitle(lang, file.path("name").asText(lang), url, file.path("ext").asText())
+        }
+        // Сначала русский и английский — их чаще всего и ищут
+        return result.sortedBy { s -> listOf("ru", "en").indexOfFirst { s.lang.startsWith(it) }.let { if (it < 0) 9 else it } }
     }
 
     /**

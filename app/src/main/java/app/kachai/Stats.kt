@@ -13,11 +13,11 @@ object Stats {
 
     fun init(app: Application) {
         val key = BuildConfig.APPMETRICA_KEY
-        if (key.isBlank()) return
+        // Отладочные запуски в статистику не шлём: иначе тесты попадают в отчёты как пользователи
+        if (key.isBlank() || BuildConfig.DEBUG) return
         runCatching {
             val config = AppMetricaConfig.newConfigBuilder(key)
                 .withLocationTracking(false)
-                .apply { if (BuildConfig.DEBUG) withLogs() }
                 .build()
             AppMetrica.activate(app, config)
             AppMetrica.enableActivityAutoTracking(app)

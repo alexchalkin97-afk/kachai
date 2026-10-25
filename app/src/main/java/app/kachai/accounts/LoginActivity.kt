@@ -78,7 +78,7 @@ class LoginActivity : ComponentActivity() {
         val prefs = (application as KachaiApp).prefs
 
         setContent {
-            val theme by prefs.themeMode.collectAsStateWithLifecycle(app.kachai.data.ThemeMode.SYSTEM)
+            val theme by prefs.themeMode.collectAsStateWithLifecycle(app.kachai.data.ThemeMode.DARK)
             KachaiTheme(theme) {
                 Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
                     Column(Modifier.statusBarsPadding()) {

@@ -94,12 +94,13 @@ fun SettingsScreen(
                 Spacer(Modifier.height(4.dp))
                 val maxHeight = vm.maxVideoHeight()
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(1080, 720, 480, 360).forEach { h ->
+                    // Те же ступени и подписи, что у вариантов в карточке ролика: Плюс обещает до 4K
+                    listOf(2160 to "4K", 1440 to "2K", 1080 to "1080p", 720 to "720p", 480 to "480p", 360 to "360p").forEach { (h, name) ->
                         val locked = h > maxHeight
                         FilterChip(
                             selected = !locked && minOf(videoHeight, maxHeight) == h,
                             onClick = { if (locked) onOpenPremium() else vm.setVideoHeight(h) },
-                            label = { Text(if (locked) "${h}p · Плюс" else "${h}p") },
+                            label = { Text(if (locked) "$name · Плюс" else name) },
                             leadingIcon = if (locked) {
                                 { Icon(Icons.Rounded.Lock, null, Modifier.size(16.dp)) }
                             } else null,
@@ -146,7 +147,7 @@ fun SettingsScreen(
 
         SectionTitle("Тема")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf(ThemeMode.SYSTEM to "Как в системе", ThemeMode.LIGHT to "Светлая", ThemeMode.DARK to "Тёмная")
+            listOf(ThemeMode.DARK to "Тёмная", ThemeMode.LIGHT to "Светлая", ThemeMode.SYSTEM to "Как в системе")
                 .forEach { (mode, label) ->
                     FilterChip(selected = theme == mode, onClick = { vm.setThemeMode(mode) }, label = { Text(label) })
                 }

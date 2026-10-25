@@ -19,8 +19,9 @@ private val Context.store: DataStore<Preferences> by preferencesDataStore("setti
 class Prefs(context: Context) {
     private val store = context.applicationContext.store
 
+    /** Тёмная — по умолчанию: так удобнее смотреть превью роликов, а на OLED-экранах экономится батарея. */
     val themeMode: Flow<ThemeMode> = store.data.map { p ->
-        p[THEME]?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() } ?: ThemeMode.SYSTEM
+        p[THEME]?.let { runCatching { ThemeMode.valueOf(it) }.getOrNull() } ?: ThemeMode.DARK
     }
     /** Что открывать по умолчанию: видео или «только звук». */
     val audioByDefault: Flow<Boolean> = store.data.map { (it[AUDIO_DEFAULT] ?: 0) == 1 }

@@ -88,6 +88,11 @@ android {
         }
         debug {
             applicationIdSuffix = ".debug"
+            // Отладочные запуски не должны крутить боевые блоки: Рекламная сеть сочтёт такие показы
+            // недействительными. Демо-блоки Яндекса всегда отдают тестовую рекламу
+            buildConfigField("String", "AD_BANNER_ID", quoted("demo-banner-yandex"))
+            buildConfigField("String", "AD_INTERSTITIAL_ID", quoted("demo-interstitial-yandex"))
+            buildConfigField("String", "AD_REWARDED_ID", quoted("demo-rewarded-yandex"))
         }
     }
 
